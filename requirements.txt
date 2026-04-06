@@ -1,0 +1,16 @@
+psycopg2-binary>=2.9
+pgvector>=0.2
+sentence-transformers>=2.7
+transformers>=4.40
+torch>=2.2
+numpy>=1.26
+pandas>=2.2
+tqdm>=4.66
+requests>=2.31
+python-dotenv>=1.0
+yfinance>=0.2
+fredapi>=0.5
+beautifulsoup4>=4.12
+lxml>=5.0
+feedparser>=6.0
+sec-edgar-downloader>=0.4
