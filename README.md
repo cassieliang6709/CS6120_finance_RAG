@@ -40,13 +40,34 @@ When running via Docker, `DATABASE_URL` is automatically set to `postgresql://po
 - Tickers: `AAPL`, `JPM`, `UNH`, `XOM`
 - Year: 2023
 - Filing types: 10-K, 10-Q
-- Embeddings: **not included** (run pipeline with embeddings to populate)
+- Embeddings: included for all `chunks` rows (`384` dimensions, `all-MiniLM-L6-v2`)
 
 Docker automatically restores it via `init-db.sh` on first boot. To restore manually:
 
 ```bash
 pg_restore -U postgres -d financial_rag financial_rag.dump
 ```
+
+To verify embedding coverage after restore:
+
+```sql
+SELECT COUNT(*) AS total_chunks, COUNT(embedding) AS chunks_with_embedding
+FROM chunks;
+```
+
+## Backfilling embeddings for an existing database
+
+If you already restored an older dump or loaded SEC chunks without embeddings,
+you can backfill the missing vectors in place:
+
+```bash
+.venv/bin/python -m data_pipeline.backfill_chunk_embeddings \
+  --dsn postgresql:///financial_rag \
+  --batch-size 64
+```
+
+The script runs in offline Hugging Face mode by default and reuses the locally
+cached `sentence-transformers/all-MiniLM-L6-v2` model when available.
 
 ## Running the pipeline locally
 
