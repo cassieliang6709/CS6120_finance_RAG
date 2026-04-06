@@ -12,11 +12,13 @@ by EDGAR's fair-use policy).
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import logging
 import os
+import re
 import time
 from pathlib import Path
-from typing import Generator
+from typing import Generator, Optional
 
 from sec_edgar_downloader import Downloader
 
@@ -32,8 +34,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Type alias for filing metadata tuples returned to the pipeline
 # ---------------------------------------------------------------------------
-FilingMeta = tuple[str, str, int, Path, str]
-#              ticker  type  year  local_path  source_url
+FilingMeta = tuple[str, str, int, str, Path, str, Optional[dt.date]]
+#              ticker  type  fiscal_year  period  local_path  source_url  filed_date
 
 
 # ---------------------------------------------------------------------------
@@ -83,13 +85,101 @@ def _iter_filing_paths(
             yield candidates[0], accession
 
 
-def _build_source_url(ticker: str, filing_type: str, accession: str) -> str:
-    """Construct the EDGAR viewer URL for a given accession number."""
+def _build_source_url(cik: str, accession: str) -> str:
+    """Construct the EDGAR viewer URL for a given CIK + accession number."""
     accession_clean = accession.replace("-", "")
+    cik_clean = str(int(cik))
     return (
         f"https://www.sec.gov/Archives/edgar/data/"
-        f"{ticker}/{accession_clean}/{accession}-index.htm"
+        f"{cik_clean}/{accession_clean}/{accession}-index.htm"
     )
+
+
+def _parse_submission_metadata(accession_dir: Path) -> dict[str, str]:
+    """
+    Parse SEC header metadata from ``full-submission.txt``.
+    """
+    submission_path = accession_dir / "full-submission.txt"
+    if not submission_path.exists():
+        return {}
+
+    try:
+        text = submission_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {}
+
+    header = text[:8000]
+    patterns = {
+        "cik": r"CENTRAL INDEX KEY:\s+([0-9]+)",
+        "filed_date": r"FILED AS OF DATE:\s+(\d{8})",
+        "period_of_report": r"CONFORMED PERIOD OF REPORT:\s+(\d{8})",
+        "fiscal_year_end": r"FISCAL YEAR END:\s+(\d{4})",
+    }
+
+    metadata: dict[str, str] = {}
+    for key, pattern in patterns.items():
+        match = re.search(pattern, header)
+        if match:
+            metadata[key] = match.group(1)
+    return metadata
+
+
+def _parse_yyyymmdd(raw: str | None) -> dt.date | None:
+    """Convert ``YYYYMMDD`` strings to ``date`` objects."""
+    if not raw or len(raw) != 8 or not raw.isdigit():
+        return None
+    return dt.datetime.strptime(raw, "%Y%m%d").date()
+
+
+def _infer_fiscal_year(report_date: dt.date | None, fiscal_year_end_mmdd: str | None) -> int:
+    """
+    Infer the filing's fiscal year from period-of-report and fiscal year end.
+    """
+    if report_date is None:
+        return 0
+
+    if not fiscal_year_end_mmdd or len(fiscal_year_end_mmdd) != 4 or not fiscal_year_end_mmdd.isdigit():
+        return report_date.year
+
+    fy_end_month = int(fiscal_year_end_mmdd[:2])
+    fy_end_day = int(fiscal_year_end_mmdd[2:])
+
+    if (report_date.month, report_date.day) > (fy_end_month, fy_end_day):
+        return report_date.year + 1
+    return report_date.year
+
+
+def _infer_period(
+    filing_type: str,
+    report_date: dt.date | None,
+    fiscal_year_end_mmdd: str | None,
+) -> str:
+    """
+    Infer the period label for the filing.
+    """
+    if filing_type == "10-K":
+        return "annual"
+    if filing_type == "8-K":
+        return "event"
+    if filing_type != "10-Q" or report_date is None:
+        return "unknown"
+
+    if not fiscal_year_end_mmdd or len(fiscal_year_end_mmdd) != 4 or not fiscal_year_end_mmdd.isdigit():
+        return f"Q{((report_date.month - 1) // 3) + 1}"
+
+    fy_end_month = int(fiscal_year_end_mmdd[:2])
+    fy_end_day = int(fiscal_year_end_mmdd[2:])
+    fiscal_year = _infer_fiscal_year(report_date, fiscal_year_end_mmdd)
+
+    try:
+        prior_fy_end = dt.date(fiscal_year - 1, fy_end_month, fy_end_day)
+    except ValueError:
+        # Fallback for unusual fiscal-year-end dates like Feb 29 in non-leap years.
+        prior_fy_end = dt.date(fiscal_year - 1, fy_end_month, min(fy_end_day, 28))
+
+    delta_days = (report_date - prior_fy_end).days
+    quarter_num = max(1, min(4, int(round(delta_days / 91.0))))
+    return f"Q{quarter_num}"
 
 
 # ---------------------------------------------------------------------------
@@ -213,8 +303,6 @@ class SECDownloader:
     ) -> list[FilingMeta]:
         """
         Walk the download directory and build FilingMeta tuples.
-        Year filtering is approximate (based on directory modification time
-        and filing naming conventions).
         """
         results: list[FilingMeta] = []
         year_set = set(years)
@@ -223,14 +311,21 @@ class SECDownloader:
             for filing_type in filing_types:
                 root = _filing_root(self.download_dir, ticker, filing_type)
                 for doc_path, accession in _iter_filing_paths(root):
-                    # Attempt to extract fiscal year from accession dir name
-                    # or fall back to file mtime
-                    year = _guess_year_from_path(doc_path, accession)
-                    if year not in year_set:
+                    metadata = _parse_submission_metadata(doc_path.parent)
+                    report_date = _parse_yyyymmdd(metadata.get("period_of_report"))
+                    filed_date = _parse_yyyymmdd(metadata.get("filed_date"))
+                    fiscal_year = _infer_fiscal_year(report_date, metadata.get("fiscal_year_end"))
+                    if fiscal_year not in year_set:
                         continue
-                    source_url = _build_source_url(ticker, filing_type, accession)
+                    period = _infer_period(
+                        filing_type,
+                        report_date,
+                        metadata.get("fiscal_year_end"),
+                    )
+                    cik = metadata.get("cik")
+                    source_url = _build_source_url(cik, accession) if cik else ""
                     results.append(
-                        (ticker, filing_type, year, doc_path, source_url)
+                        (ticker, filing_type, fiscal_year, period, doc_path, source_url, filed_date)
                     )
 
         logger.info("Collected %d filing documents from disk", len(results))
@@ -281,32 +376,6 @@ async def download_async(
     ]
     await asyncio.gather(*tasks, return_exceptions=True)
     return dl._collect_metadata(tickers, filing_types, years)
-
-
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
-def _guess_year_from_path(doc_path: Path, accession: str) -> int:
-    """
-    Try to determine the fiscal year from the accession number (which
-    encodes the filing date as YYYYMMDD) or fall back to mtime year.
-    """
-    # Accession numbers have format: XXXXXXXXXX-YY-NNNNNN
-    # where YY is the 2-digit year of filing
-    parts = accession.split("-")
-    if len(parts) >= 2:
-        yy = parts[1]
-        if yy.isdigit():
-            year = int(yy)
-            return 2000 + year if year < 100 else year
-    # Fall back to file modification time
-    try:
-        mtime = doc_path.stat().st_mtime
-        import datetime
-        return datetime.datetime.fromtimestamp(mtime).year
-    except OSError:
-        return 0
 
 
 # ---------------------------------------------------------------------------

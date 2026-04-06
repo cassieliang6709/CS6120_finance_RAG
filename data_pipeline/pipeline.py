@@ -169,10 +169,18 @@ def _process_filings(
     total_chunks = 0
 
     # Group filings by filing type to reuse cleaner
-    for ticker, filing_type, fiscal_year, local_path, source_url in tqdm(
-        filing_metas, desc="Processing filings", unit="filing"
-    ):
+    for filing_meta in tqdm(filing_metas, desc="Processing filings", unit="filing"):
         try:
+            if len(filing_meta) == 5:
+                ticker, filing_type, fiscal_year, local_path, source_url = filing_meta
+                period = _infer_period(filing_type, fiscal_year)
+                filed_date = None
+            elif len(filing_meta) == 6:
+                ticker, filing_type, fiscal_year, local_path, source_url, filed_date = filing_meta
+                period = _infer_period(filing_type, fiscal_year)
+            else:
+                ticker, filing_type, fiscal_year, period, local_path, source_url, filed_date = filing_meta
+
             if filing_type not in cleaner_cache:
                 cleaner_cache[filing_type] = HTMLCleaner(filing_type=filing_type)
             cleaner = cleaner_cache[filing_type]
@@ -187,13 +195,12 @@ def _process_filings(
                 continue
 
             # Ensure filing row exists in DB
-            period = _infer_period(filing_type, fiscal_year)
             filing_row = {
                 "ticker": ticker,
                 "filing_type": filing_type,
                 "fiscal_year": fiscal_year,
                 "period": period,
-                "filed_date": None,
+                "filed_date": filed_date,
                 "source_url": source_url,
                 "local_path": str(local_path),
             }
@@ -225,7 +232,9 @@ def _process_filings(
                         "filing_type": filing_type,
                         "fiscal_year": fiscal_year,
                         "period": period,
+                        "filed_date": filed_date,
                         "section_name": section_name,
+                        "chunk_index": i,
                         "content": chunk_text,
                         "char_count": len(chunk_text),
                         "token_count": token_count,

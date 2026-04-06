@@ -60,7 +60,9 @@ CREATE TABLE IF NOT EXISTS chunks (
     filing_type     TEXT        NOT NULL,
     fiscal_year     SMALLINT,
     period          TEXT,
+    filed_date      DATE,
     section_name    TEXT,                   -- 'MD&A', 'Risk Factors', etc.
+    chunk_index     INTEGER,
     content         TEXT        NOT NULL,
     char_count      INTEGER     NOT NULL,
     token_count     INTEGER     NOT NULL,
@@ -70,11 +72,66 @@ CREATE TABLE IF NOT EXISTS chunks (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS filed_date DATE;
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS chunk_index INTEGER;
+
+UPDATE chunks c
+SET filed_date = f.filed_date
+FROM filings f
+WHERE c.filing_id = f.id
+  AND c.filed_date IS NULL;
+
+WITH chunk_positions AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (
+            PARTITION BY filing_id
+            ORDER BY id
+        ) - 1 AS inferred_chunk_index
+    FROM chunks
+    WHERE chunk_index IS NULL
+)
+UPDATE chunks c
+SET chunk_index = cp.inferred_chunk_index
+FROM chunk_positions cp
+WHERE c.id = cp.id;
+
+ALTER TABLE chunks
+    ALTER COLUMN chunk_index SET NOT NULL;
+
 -- Vector similarity index (IVFFlat – good for recall at scale)
--- lists = sqrt(row_count) is a reasonable heuristic; adjust after loading.
-CREATE INDEX IF NOT EXISTS idx_chunks_embedding_ivfflat
-    ON chunks USING ivfflat (embedding vector_cosine_ops)
-    WITH (lists = 100);
+-- lists = sqrt(row_count) is a reasonable heuristic; for the expected corpus
+-- size, 256 is a better default than 100.
+DO $$
+DECLARE
+    index_reloptions TEXT[];
+BEGIN
+    SELECT c.reloptions
+    INTO index_reloptions
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE c.relname = 'idx_chunks_embedding_ivfflat'
+      AND n.nspname = current_schema();
+
+    IF index_reloptions IS NULL THEN
+        EXECUTE '
+            CREATE INDEX idx_chunks_embedding_ivfflat
+            ON chunks USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 256)
+        ';
+    ELSIF NOT ('lists=256' = ANY(index_reloptions)) THEN
+        EXECUTE 'DROP INDEX idx_chunks_embedding_ivfflat';
+        EXECUTE '
+            CREATE INDEX idx_chunks_embedding_ivfflat
+            ON chunks USING ivfflat (embedding vector_cosine_ops)
+            WITH (lists = 256)
+        ';
+    END IF;
+END
+$$;
 
 -- Full-text search
 CREATE INDEX IF NOT EXISTS idx_chunks_content_tsv
@@ -85,6 +142,10 @@ CREATE INDEX IF NOT EXISTS idx_chunks_ticker
     ON chunks (ticker);
 CREATE INDEX IF NOT EXISTS idx_chunks_filing_id
     ON chunks (filing_id);
+CREATE INDEX IF NOT EXISTS idx_chunks_filing_chunk_index
+    ON chunks (filing_id, chunk_index);
+CREATE INDEX IF NOT EXISTS idx_chunks_filed_date
+    ON chunks (filed_date);
 CREATE INDEX IF NOT EXISTS idx_chunks_sector_type
     ON chunks (sector, filing_type);
 CREATE INDEX IF NOT EXISTS idx_chunks_fiscal_year
@@ -95,14 +156,17 @@ CREATE INDEX IF NOT EXISTS idx_chunks_section
 -- Auto-populate tsvector on insert/update
 CREATE OR REPLACE FUNCTION chunks_tsv_trigger() RETURNS TRIGGER AS $$
 BEGIN
-    NEW.content_tsv := to_tsvector('english', COALESCE(NEW.content, ''));
+    NEW.content_tsv := to_tsvector(
+        'english',
+        COALESCE(NEW.section_name, '') || ' ' || COALESCE(NEW.content, '')
+    );
     RETURN NEW;
 END;
 $$ LANGUAGE plpgsql;
 
 DROP TRIGGER IF EXISTS trig_chunks_tsv ON chunks;
 CREATE TRIGGER trig_chunks_tsv
-    BEFORE INSERT OR UPDATE OF content ON chunks
+    BEFORE INSERT OR UPDATE OF section_name, content ON chunks
     FOR EACH ROW EXECUTE FUNCTION chunks_tsv_trigger();
 
 -- =============================================================================
@@ -312,7 +376,6 @@ SELECT
     c.embedding,
     c.content_tsv,
     c.source_url,
-    f.filed_date
+    c.filed_date
 FROM chunks c
-JOIN filings  f  ON f.id      = c.filing_id
 JOIN companies co ON co.ticker = c.ticker;

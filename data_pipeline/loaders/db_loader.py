@@ -232,20 +232,24 @@ class DBLoader:
         Upsert filing text chunks into ``chunks``.
 
         Expected keys: filing_id, ticker, sector, filing_type, fiscal_year,
-                       period, section_name, content, char_count, token_count,
-                       embedding (numpy array or list), source_url.
+                       period, filed_date, section_name, chunk_index, content,
+                       char_count, token_count, embedding (numpy array or list),
+                       source_url.
 
         The ``content_tsv`` column is populated automatically by a DB trigger.
         """
         sql = """
             INSERT INTO chunks (
                 filing_id, ticker, sector, filing_type, fiscal_year, period,
-                section_name, content, char_count, token_count, embedding, source_url
+                filed_date, section_name, chunk_index, content, char_count,
+                token_count, embedding, source_url
             )
             VALUES (
                 %(filing_id)s, %(ticker)s, %(sector)s, %(filing_type)s,
-                %(fiscal_year)s, %(period)s, %(section_name)s, %(content)s,
-                %(char_count)s, %(token_count)s, %(embedding)s, %(source_url)s
+                %(fiscal_year)s, %(period)s,
+                COALESCE(%(filed_date)s, (SELECT filed_date FROM filings WHERE id = %(filing_id)s)),
+                %(section_name)s, %(chunk_index)s, %(content)s, %(char_count)s,
+                %(token_count)s, %(embedding)s, %(source_url)s
             )
             ON CONFLICT DO NOTHING
         """
@@ -253,6 +257,8 @@ class DBLoader:
         normalised_rows = []
         for row in rows:
             r = dict(row)
+            r.setdefault("filed_date", None)
+            r.setdefault("chunk_index", None)
             if r.get("embedding") is not None:
                 if not isinstance(r["embedding"], np.ndarray):
                     r["embedding"] = np.array(r["embedding"], dtype=np.float32)
