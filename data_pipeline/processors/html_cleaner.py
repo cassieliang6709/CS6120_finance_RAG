@@ -135,7 +135,9 @@ _ITEM_HEADER_RE = re.compile(
 
 def _normalize_item(raw: str) -> str:
     """Normalize an item label to lowercase for map lookup, e.g. 'ITEM 1A' -> 'item 1a'."""
-    return raw.strip().lower()
+    raw = raw.replace("\xa0", " ")
+    raw = re.sub(r"\s+", " ", raw).strip().lower()
+    return raw
 
 
 def _map_section(item_label: str, filing_type: str) -> str:
@@ -254,7 +256,7 @@ class HTMLCleaner:
         """Truncate text at the first signature block."""
         for pattern in SIGNATURE_PATTERNS:
             m = pattern.search(text)
-            if m:
+            if m and m.start() > max(5_000, int(len(text) * 0.5)):
                 return text[: m.start()].rstrip()
         return text
 
@@ -262,7 +264,7 @@ class HTMLCleaner:
         """Truncate text at the exhibit index."""
         for pattern in EXHIBIT_PATTERNS:
             m = pattern.search(text)
-            if m:
+            if m and m.start() > max(5_000, int(len(text) * 0.5)):
                 return text[: m.start()].rstrip()
         return text
 
@@ -299,6 +301,23 @@ class HTMLCleaner:
                 sections.append((section_name, section_text))
 
         return sections if sections else [("Full Document", text.strip())]
+
+    def _filter_sections(
+        self,
+        sections: list[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        """
+        Drop low-value appendix sections that are usually harmful for retrieval.
+        """
+        filtered: list[tuple[str, str]] = []
+        for section_name, section_text in sections:
+            normalized = _normalize_item(section_name)
+            if section_name == "Exhibits":
+                continue
+            if normalized in {"item 16", "item 6"} and len(section_text) > 100_000:
+                continue
+            filtered.append((section_name, section_text))
+        return filtered
 
     # ------------------------------------------------------------------
     # Public API
@@ -347,6 +366,7 @@ class HTMLCleaner:
 
         # Split into sections
         sections = self._split_sections(text)
+        sections = self._filter_sections(sections)
 
         logger.debug(
             "Cleaned %s: %d sections, %d total chars",
@@ -374,7 +394,7 @@ class HTMLCleaner:
         text = self._remove_exhibit_index(text)
         text = self._strip_boilerplate_phrases(text)
 
-        return self._split_sections(text)
+        return self._filter_sections(self._split_sections(text))
 
 
 # ---------------------------------------------------------------------------
