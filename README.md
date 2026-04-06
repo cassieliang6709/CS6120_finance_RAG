@@ -19,6 +19,18 @@ To start only the database (e.g. for local development):
 docker compose up db
 ```
 
+The `db` service uses a named Docker volume, `pgdata`, to persist PostgreSQL
+data across container restarts. Because of that, `financial_rag.dump` is only
+restored the first time that volume is initialized.
+
+If you already ran Docker once and want the database to be recreated from a
+newer `financial_rag.dump`, remove the existing volume first:
+
+```bash
+docker compose down -v
+docker compose up --build
+```
+
 ## Environment variables
 
 `.env` is checked into the repo with the project defaults. Edit before running if needed:
