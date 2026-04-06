@@ -3,7 +3,6 @@ data/
 sec-edgar-filings/
 *.jsonl
 *.npy
-*.dump
 *.pgdump
 *.csv
 
