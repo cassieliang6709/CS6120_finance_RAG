@@ -33,8 +33,6 @@ env/
 *.ipynb_checkpoints
 
 # ── Secrets / env ────────────────────────────────────────────────────────────
-.env
-.env.*
 secrets.json
 config_local.py
 
