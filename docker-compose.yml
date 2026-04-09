@@ -1,6 +1,6 @@
 services:
   db:
-    image: pgvector/pgvector:pg16
+    image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
@@ -17,18 +17,38 @@ services:
       timeout: 5s
       retries: 10
 
-  pipeline:
-    build: .
+  # pipeline:
+  #   build: .
+  #   depends_on:
+  #     db:
+  #       condition: service_healthy
+  #   environment:
+  #     DATABASE_URL: postgresql://postgres:postgres@db:5432/financial_rag
+  #   env_file:
+  #     - .env
+  #   volumes:
+  #     - ./data:/app/data
+  #     - ./pipeline.log:/app/pipeline.log
+
+  retrieval:
+    build: ./retrieval
     depends_on:
       db:
         condition: service_healthy
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/financial_rag
-    env_file:
-      - .env
-    volumes:
-      - ./data:/app/data
-      - ./pipeline.log:/app/pipeline.log
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_NAME: financial_rag
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+    ports:
+      - "8000:8000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
 
 volumes:
   pgdata:

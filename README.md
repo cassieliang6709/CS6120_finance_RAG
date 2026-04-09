@@ -11,24 +11,12 @@ docker compose up --build
 This starts two services:
 
 - **db** — `pgvector/pgvector:pg16`, restores `financial_rag.dump` on first boot
-- **pipeline** — runs the full pipeline against the database
+- **retrieval** — hybrid search API, available at `http://localhost:8000`
 
-To start only the database (e.g. for local development):
-
-```bash
-docker compose up db
-```
-
-The `db` service uses a named Docker volume, `pgdata`, to persist PostgreSQL
-data across container restarts. Because of that, `financial_rag.dump` is only
-restored the first time that volume is initialized.
-
-If you already ran Docker once and want the database to be recreated from a
-newer `financial_rag.dump`, remove the existing volume first:
+If already build once:
 
 ```bash
-docker compose down -v
-docker compose up --build
+docker compose up
 ```
 
 ## Environment variables
@@ -44,6 +32,8 @@ docker compose up --build
 | `LOG_FILE` | `./pipeline.log` | Log output path |
 
 When running via Docker, `DATABASE_URL` is automatically set to `postgresql://postgres:postgres@db:5432/financial_rag` by `docker-compose.yml` and the `.env` value is ignored.
+
+The `pipeline` service is commented out in `docker-compose.yml`. Run the pipeline directly against the database (see **Running the pipeline locally** below).
 
 ## Database dump
 
