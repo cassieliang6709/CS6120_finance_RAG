@@ -1,0 +1,15 @@
+aws_region     = "us-east-1"
+image_tag      = "latest"
+
+# T1's GCP PostgreSQL instance
+db_host        = "34.xxx.xxx.xxx"   # Replace with T1's GCP static IP or Cloud SQL proxy host
+db_port        = "5432"
+db_name        = "financial_rag"
+db_user        = "postgres"
+
+embedding_model = "sentence-transformers/all-MiniLM-L6-v2"
+default_k       = "5"
+default_alpha   = "0.7"
+
+# T3's security group ID — get this from T3 after they deploy their generate service
+generate_sg_id = "sg-xxxxxxxxxxxxxxxxx"
