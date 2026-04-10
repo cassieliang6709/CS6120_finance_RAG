@@ -41,6 +41,15 @@ services:
       DB_NAME: financial_rag
       DB_USER: postgres
       DB_PASSWORD: postgres
+      # LLM (HPC SGLang endpoint, backend-only — read from repo-root .env)
+      SGLANG_BASE_URL: ${SGLANG_BASE_URL:-}
+      SGLANG_MODEL: ${SGLANG_MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}
+      SGLANG_API_KEY: ${SGLANG_API_KEY:-}
+      SGLANG_MAX_TOKENS: ${SGLANG_MAX_TOKENS:-32768}
+      # Public /chat endpoint auth (empty = disabled)
+      API_KEY: ${API_KEY:-}
+      # CORS allow-list for frontend (wide-open for dev)
+      CORS_ORIGINS: ${CORS_ORIGINS:-*}
     ports:
       - "8000:8000"
     healthcheck:

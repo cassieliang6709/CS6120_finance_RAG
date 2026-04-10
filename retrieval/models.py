@@ -27,3 +27,20 @@ class ChunkResult(BaseModel):
 
 class RetrieveResponse(BaseModel):
     chunks: list[ChunkResult]
+
+
+class ChatRequest(BaseModel):
+    query: str = Field(..., min_length=1)
+    k: int = Field(default=5, ge=1, le=20)
+    alpha: float = Field(default=0.7, ge=0.0, le=1.0)
+    sector: Optional[str] = None
+    company: Optional[str] = None
+    filing_type: Optional[str] = None
+    stream: bool = True
+    system_prompt: Optional[str] = None
+
+
+class ChatResponse(BaseModel):
+    answer: str
+    thinking: Optional[str] = None
+    chunks: list[ChunkResult]
