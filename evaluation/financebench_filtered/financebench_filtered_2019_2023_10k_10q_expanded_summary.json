@@ -1,0 +1,49 @@
+{
+  "source": "PatronusAI/financebench [train]",
+  "spec_name": "financebench_filter_spec_expanded.json",
+  "input_row_count": 150,
+  "filtered_row_count": 105,
+  "counts_by_ticker": {
+    "MMM": 6,
+    "ATVI": 2,
+    "ADBE": 2,
+    "AES": 3,
+    "AMZN": 1,
+    "AMCR": 6,
+    "AMD": 7,
+    "AXP": 7,
+    "AWK": 3,
+    "BBY": 4,
+    "SQ": 2,
+    "BA": 7,
+    "KO": 2,
+    "GLW": 4,
+    "COST": 1,
+    "CVS": 3,
+    "GIS": 4,
+    "JNJ": 3,
+    "JPM": 5,
+    "KHC": 1,
+    "LMT": 3,
+    "MGM": 3,
+    "MSFT": 1,
+    "NKE": 3,
+    "PYPL": 1,
+    "PEP": 6,
+    "PFE": 6,
+    "ULTA": 2,
+    "VZ": 5,
+    "WMT": 2
+  },
+  "counts_by_doc_type": {
+    "10k": 93,
+    "10q": 12
+  },
+  "counts_by_doc_period": {
+    "2019": 8,
+    "2020": 10,
+    "2021": 14,
+    "2022": 53,
+    "2023": 20
+  }
+}
