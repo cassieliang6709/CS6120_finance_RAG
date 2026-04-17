@@ -6,6 +6,8 @@ This service implements the `/retrieve` endpoint for the financial RAG pipeline.
 
 The search strategy is **hybrid**: it runs vector similarity search and BM25 keyword search in parallel, normalizes both score distributions to [0, 1], and fuses them with a configurable weight `alpha`. The result is a ranked list of chunks with full provenance — company, filing type, date, and a direct SEC EDGAR URL. An optional metadata filter (sector, company, filing type) narrows the corpus before either search branch runs.
 
+On top of hybrid search, the service applies **metadata-aware boosting**: when a company ticker, filing type, or fiscal year is detected in the query text, a configurable score multiplier is baked directly into the SQL `ORDER BY` of both search branches. This ensures that relevant chunks from the mentioned company/period rank higher in the retrieved candidate pool — not just in post-retrieval reordering.
+
 **Where this fits:**
 ```
 Frontend (T4)
@@ -69,6 +71,31 @@ curl -s -X POST http://localhost:8000/retrieve \
   -d '{"query": "risk factors interest rate", "k": 5, "alpha": 0.0}' | python3 -m json.tool
 ```
 
+### Testing metadata-aware boosting
+
+These queries exercise each boost signal. Results should be dominated by the expected company, filing type, or fiscal year.
+
+Ticker detection — `AMD` in all-caps triggers company boost:
+```bash
+curl -s -X POST http://localhost:8000/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What are AMD risk factors?","k":5}' | python3 -m json.tool
+```
+
+Filing type detection — `annual report` triggers 10-K boost:
+```bash
+curl -s -X POST http://localhost:8000/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What does the annual report say about JPM revenue?","k":5}' | python3 -m json.tool
+```
+
+Fiscal year detection — `FY2022` triggers year boost:
+```bash
+curl -s -X POST http://localhost:8000/retrieve \
+  -H "Content-Type: application/json" \
+  -d '{"query":"What were MSFT earnings in FY2022?","k":5}' | python3 -m json.tool
+```
+
 ### Running tests locally
 
 ```bash
@@ -104,6 +131,32 @@ hybrid_score = α × score_v + (1 − α) × score_b
 ```
 
 The pool is sorted descending by `hybrid_score` and the top-k are returned. Default `alpha = 0.7` favors semantic similarity; set `alpha = 1.0` for pure vector, `alpha = 0.0` for pure BM25.
+
+### Metadata-aware boosting
+
+SEC filings contain large amounts of boilerplate text (e.g. "risk factors" language) that is semantically similar across all companies. A query like *"What are AMD risk factors?"* would otherwise surface chunks from unrelated companies because the embedding model weights the generic phrase "risk factors" more heavily than the company name token.
+
+To counteract this, the service detects metadata signals in the query before retrieval and embeds score multipliers directly into the SQL `ORDER BY`:
+
+| Signal | How detected | Boost applied to |
+|---|---|---|
+| Company ticker | All-caps 2–5 letter tokens matched against known tickers (e.g. `AMD`, `JPM`) | Chunks where `ticker = detected_ticker` |
+| Filing type | Keywords: `10-K`, `annual report`, `annual filing`, `10-Q`, `quarterly report` | Chunks where `filing_type` matches |
+| Fiscal year | Pattern `20XX` or `FY20XX` or `fiscal year 20XX` | Chunks where `fiscal_year` matches |
+
+Detection fires on the original query text (not uppercased) to avoid false positives — common words like "are" would otherwise match the real ticker `ARE`. If the caller already supplies an explicit filter for a field (e.g. `company="AMD"`), detection is skipped for that field since the filter already restricts the corpus.
+
+Multiple signals stack multiplicatively. A query like *"What does AMD's 2022 annual report say about risk?"* hits all three signals: `COMPANY_BOOST × FILING_TYPE_BOOST × FISCAL_YEAR_BOOST`.
+
+The three boost multipliers are configurable via environment variables — set to `1.0` to disable any of them:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `COMPANY_BOOST` | `1.5` | Multiplier for chunks matching the detected company ticker |
+| `FILING_TYPE_BOOST` | `1.3` | Multiplier for chunks matching the detected filing type |
+| `FISCAL_YEAR_BOOST` | `1.3` | Multiplier for chunks matching the detected fiscal year |
+
+> **Note on scores:** Because boosts are applied before score normalization, the final hybrid scores can exceed 1.0 when boosted chunks dominate the candidate pool.
 
 ### Metadata filters
 
@@ -236,6 +289,9 @@ All filter fields are case-sensitive and must match exactly what is stored in th
 | `EMBEDDING_MODEL` | No | `sentence-transformers/all-MiniLM-L6-v2` | Must match T1's ingestion model |
 | `DEFAULT_K` | No | `5` | Default number of chunks returned |
 | `DEFAULT_ALPHA` | No | `0.7` | Default hybrid weight |
+| `COMPANY_BOOST` | No | `1.5` | Score multiplier for chunks matching a company ticker detected in the query. Set to `1.0` to disable. |
+| `FILING_TYPE_BOOST` | No | `1.3` | Score multiplier for chunks matching a filing type detected in the query. Set to `1.0` to disable. |
+| `FISCAL_YEAR_BOOST` | No | `1.3` | Score multiplier for chunks matching a fiscal year detected in the query. Set to `1.0` to disable. |
 
 ---
 
@@ -279,7 +335,7 @@ Defines the three Pydantic models that form the public contract with T3. `Retrie
 Manages a singleton asyncpg connection pool. `get_pool()` creates the pool on first call and reuses it thereafter. `_init_connection` registers the pgvector type codec on every connection. `close_pool()` is called on FastAPI shutdown.
 
 ### `retrieval.py`
-Core logic. `embed_query` encodes a string to a 384-dim float list. `minmax_normalize` scales scores to [0, 1]. `fuse_scores` combines vector and BM25 scores by `alpha`. `retrieve` runs both searches in parallel, merges, normalizes, fuses, and returns sorted `ChunkResult` objects. Queries use the `v_chunk_search` view.
+Core logic. `embed_query` encodes a string to a 384-dim float list. `minmax_normalize` scales scores to [0, 1]. `fuse_scores` combines vector and BM25 scores by `alpha`. `load_known_tickers` populates an in-process cache of all tickers and company names from the DB at startup. `detect_company_in_query`, `detect_filing_type_in_query`, and `detect_year_in_query` extract metadata signals from the query text. `build_boost_expression` converts detected signals into a SQL `CASE WHEN` multiplier expression embedded in both search queries. `retrieve` detects signals, runs both searches in parallel with boosts applied, merges, normalizes, fuses, and returns sorted `ChunkResult` objects.
 
 ### `main.py`
 FastAPI entry point. `GET /health` returns `{"status": "ok"}`. `POST /retrieve` accepts a `RetrieveRequest` and returns a `RetrieveResponse`. The lifespan context manager creates and closes the DB pool.

@@ -1,15 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Optional
 
 import asyncpg
 from sentence_transformers import SentenceTransformer
 
-from config import EMBEDDING_MODEL
+from config import COMPANY_BOOST, EMBEDDING_MODEL, FILING_TYPE_BOOST, FISCAL_YEAR_BOOST
 from models import ChunkResult
 
 _model: SentenceTransformer | None = None
+_known_tickers: set[str] = set()
+_company_name_to_ticker: dict[str, str] = {}
+
+_TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
+_YEAR_RE = re.compile(r"(?:FY|fiscal\s+year\s*)?(20\d{2})", re.IGNORECASE)
+_FILING_TYPE_PATTERNS: dict[str, re.Pattern] = {
+    "10-K": re.compile(r"\b10-k\b|\bannual report\b|\bannual filing\b", re.IGNORECASE),
+    "10-Q": re.compile(r"\b10-q\b|\bquarterly report\b|\bquarterly filing\b", re.IGNORECASE),
+}
 
 
 def get_model() -> SentenceTransformer:
@@ -21,6 +31,81 @@ def get_model() -> SentenceTransformer:
 
 def embed_query(query: str) -> list[float]:
     return get_model().encode(query, normalize_embeddings=True).tolist()
+
+
+async def load_known_tickers(pool: asyncpg.Pool) -> None:
+    """Populate ticker and company-name caches from the database."""
+    global _known_tickers, _company_name_to_ticker
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT DISTINCT ticker, company_name FROM v_chunk_search WHERE ticker IS NOT NULL"
+        )
+    _known_tickers = {r["ticker"].upper() for r in rows}
+    _company_name_to_ticker = {
+        r["company_name"].lower(): r["ticker"].upper()
+        for r in rows
+        if r["company_name"]
+    }
+
+
+def detect_company_in_query(query: str) -> Optional[str]:
+    """Return a ticker matched from the query — by ticker symbol first, then full company name.
+
+    Scans the original query (not uppercased) so only tokens already written in
+    ALL-CAPS match — avoids false positives like 'are' → 'ARE' (a real ticker).
+    """
+    for match in _TICKER_RE.finditer(query):
+        if match.group(1) in _known_tickers:
+            return match.group(1)
+    query_lower = query.lower()
+    for name, ticker in _company_name_to_ticker.items():
+        if re.search(r'\b' + re.escape(name) + r'\b', query_lower):
+            return ticker
+    return None
+
+
+def detect_filing_type_in_query(query: str) -> Optional[str]:
+    """Return '10-K' or '10-Q' if the query mentions a specific filing type."""
+    for filing_type, pattern in _FILING_TYPE_PATTERNS.items():
+        if pattern.search(query):
+            return filing_type
+    return None
+
+
+def detect_year_in_query(query: str) -> Optional[str]:
+    """Return the first 20xx year string found in the query, or None."""
+    match = _YEAR_RE.search(query)
+    return match.group(1) if match else None
+
+
+def build_boost_expression(
+    boost_ticker: Optional[str],
+    boost_filing_type: Optional[str],
+    boost_year: Optional[str],
+    start_idx: int,
+) -> tuple[str, list, int]:
+    """Return a SQL multiplicative boost expression, its positional param values, and next index.
+
+    Boost values are inlined as float literals (server-controlled config); only the
+    comparison values (ticker, filing_type, year) are parameterised for safety.
+    """
+    parts: list[str] = []
+    values: list = []
+    idx = start_idx
+    if boost_ticker:
+        parts.append(f"CASE WHEN ticker = ${idx} THEN {COMPANY_BOOST}::float ELSE 1.0 END")
+        values.append(boost_ticker)
+        idx += 1
+    if boost_filing_type:
+        parts.append(f"CASE WHEN filing_type = ${idx} THEN {FILING_TYPE_BOOST}::float ELSE 1.0 END")
+        values.append(boost_filing_type)
+        idx += 1
+    if boost_year:
+        parts.append(f"CASE WHEN fiscal_year::text = ${idx} THEN {FISCAL_YEAR_BOOST}::float ELSE 1.0 END")
+        values.append(boost_year)
+        idx += 1
+    expr = " * ".join(parts) if parts else "1.0"
+    return expr, values, idx
 
 
 def minmax_normalize(scores: list[float]) -> list[float]:
@@ -81,28 +166,34 @@ async def _vector_search(
     limit: int,
     filter_where: str,
     filter_params: dict,
+    boost_ticker: Optional[str] = None,
+    boost_filing_type: Optional[str] = None,
+    boost_year: Optional[str] = None,
 ) -> list[dict]:
-    sql = """
+    boost_expr, boost_vals, _ = build_boost_expression(
+        boost_ticker, boost_filing_type, boost_year, start_idx=3 + len(filter_params)
+    )
+    sql = f"""
         SELECT
-            id::text                                              AS chunk_id,
-            ticker                                                AS company,
+            id::text                                                      AS chunk_id,
+            ticker                                                        AS company,
             sector,
             filing_type,
             filed_date,
             source_url,
-            content                                               AS text,
+            content                                                       AS text,
             company_name,
             fiscal_year,
-            1 - (embedding <=> $1::vector)                        AS score_v
+            (1 - (embedding <=> $1::vector)) * {boost_expr}              AS score_v
         FROM v_chunk_search
         WHERE embedding IS NOT NULL
         __FILTER__
-        ORDER BY embedding <=> $1::vector
+        ORDER BY (1 - (embedding <=> $1::vector)) * {boost_expr} DESC
         LIMIT $2
     """
-    sql, extra, _ = _apply_filter(sql, filter_where, filter_params, next_idx=3)
+    sql, filter_vals, _ = _apply_filter(sql, filter_where, filter_params, next_idx=3)
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, query_vec, limit, *extra)
+        rows = await conn.fetch(sql, query_vec, limit, *filter_vals, *boost_vals)
     return [dict(r) for r in rows]
 
 
@@ -112,28 +203,34 @@ async def _bm25_search(
     limit: int,
     filter_where: str,
     filter_params: dict,
+    boost_ticker: Optional[str] = None,
+    boost_filing_type: Optional[str] = None,
+    boost_year: Optional[str] = None,
 ) -> list[dict]:
-    sql = """
+    boost_expr, boost_vals, _ = build_boost_expression(
+        boost_ticker, boost_filing_type, boost_year, start_idx=3 + len(filter_params)
+    )
+    sql = f"""
         SELECT
-            id::text                                              AS chunk_id,
-            ticker                                                AS company,
+            id::text                                                              AS chunk_id,
+            ticker                                                                AS company,
             sector,
             filing_type,
             filed_date,
             source_url,
-            content                                               AS text,
+            content                                                               AS text,
             company_name,
             fiscal_year,
-            ts_rank(content_tsv, plainto_tsquery('english', $1))  AS score_b
+            ts_rank(content_tsv, plainto_tsquery('english', $1)) * {boost_expr}  AS score_b
         FROM v_chunk_search
         WHERE content_tsv @@ plainto_tsquery('english', $1)
         __FILTER__
         ORDER BY score_b DESC
         LIMIT $2
     """
-    sql, extra, _ = _apply_filter(sql, filter_where, filter_params, next_idx=3)
+    sql, filter_vals, _ = _apply_filter(sql, filter_where, filter_params, next_idx=3)
     async with pool.acquire() as conn:
-        rows = await conn.fetch(sql, query, limit, *extra)
+        rows = await conn.fetch(sql, query, limit, *filter_vals, *boost_vals)
     return [dict(r) for r in rows]
 
 
@@ -150,14 +247,22 @@ async def retrieve(
     query_vec = embed_query(query)
     filter_where, filter_params = build_filter_clause(sector, company, filing_type)
 
+    # Detect signals before retrieval so boosts are embedded in SQL ORDER BY,
+    # affecting which chunks the DB returns rather than just reordering them after.
+    boost_ticker = None if company else detect_company_in_query(query)
+    boost_filing_type = None if filing_type else detect_filing_type_in_query(query)
+    boost_year = detect_year_in_query(query)
+
     vec_rows, bm25_rows = await asyncio.gather(
-        _vector_search(pool, query_vec, overfetch, filter_where, filter_params),
-        _bm25_search(pool, query, overfetch, filter_where, filter_params),
+        _vector_search(pool, query_vec, overfetch, filter_where, filter_params,
+                       boost_ticker, boost_filing_type, boost_year),
+        _bm25_search(pool, query, overfetch, filter_where, filter_params,
+                     boost_ticker, boost_filing_type, boost_year),
     )
 
     vec_map: dict[str, dict] = {r["chunk_id"]: r for r in vec_rows}
     bm25_map: dict[str, dict] = {r["chunk_id"]: r for r in bm25_rows}
-    all_ids = list({**vec_map, **bm25_map}.keys()) 
+    all_ids = list({**vec_map, **bm25_map}.keys())
 
     raw_v = [vec_map[cid]["score_v"] if cid in vec_map else 0.0 for cid in all_ids]
     raw_b = [bm25_map[cid]["score_b"] if cid in bm25_map else 0.0 for cid in all_ids]

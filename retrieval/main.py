@@ -11,12 +11,13 @@ import config
 from chat import chat_once, stream_chat
 from db import close_pool, get_pool
 from models import ChatRequest, ChatResponse, RetrieveRequest, RetrieveResponse
-from retrieval import retrieve
+from retrieval import load_known_tickers, retrieve
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    await get_pool()
+    pool = await get_pool()
+    await load_known_tickers(pool)
     yield
     await close_pool()
 
