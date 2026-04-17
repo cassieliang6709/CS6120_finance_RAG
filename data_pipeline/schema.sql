@@ -102,6 +102,35 @@ WHERE c.id = cp.id;
 ALTER TABLE chunks
     ALTER COLUMN chunk_index SET NOT NULL;
 
+WITH ranked_chunks AS (
+    SELECT
+        id,
+        ROW_NUMBER() OVER (
+            PARTITION BY filing_id, chunk_index
+            ORDER BY id
+        ) AS row_num
+    FROM chunks
+)
+DELETE FROM chunks c
+USING ranked_chunks rc
+WHERE c.id = rc.id
+  AND rc.row_num > 1;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chunks_filing_id_chunk_index_key'
+          AND conrelid = 'chunks'::regclass
+    ) THEN
+        ALTER TABLE chunks
+            ADD CONSTRAINT chunks_filing_id_chunk_index_key
+            UNIQUE (filing_id, chunk_index);
+    END IF;
+END
+$$;
+
 -- Vector similarity index (IVFFlat – good for recall at scale)
 -- lists = sqrt(row_count) is a reasonable heuristic; for the expected corpus
 -- size, 256 is a better default than 100.
@@ -295,7 +324,52 @@ CREATE TRIGGER trig_news_tsv
     FOR EACH ROW EXECUTE FUNCTION news_tsv_trigger();
 
 -- =============================================================================
--- 8. earnings_transcripts
+-- 8. news_chunks
+-- =============================================================================
+CREATE TABLE IF NOT EXISTS news_chunks (
+    id              BIGSERIAL   PRIMARY KEY,
+    news_article_id BIGINT      NOT NULL REFERENCES news_articles (id) ON DELETE CASCADE,
+    ticker          TEXT        REFERENCES companies (ticker) ON DELETE SET NULL,
+    published_date  TIMESTAMPTZ,
+    source          TEXT,
+    chunk_index     INTEGER     NOT NULL,
+    content         TEXT        NOT NULL,
+    token_count     INTEGER     NOT NULL,
+    embedding       vector(384),
+    content_tsv     TSVECTOR,
+    source_url      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (news_article_id, chunk_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_news_chunks_embedding_ivfflat
+    ON news_chunks USING ivfflat (embedding vector_cosine_ops)
+    WITH (lists = 50);
+
+CREATE INDEX IF NOT EXISTS idx_news_chunks_content_tsv
+    ON news_chunks USING GIN (content_tsv);
+
+CREATE INDEX IF NOT EXISTS idx_news_chunks_ticker
+    ON news_chunks (ticker);
+CREATE INDEX IF NOT EXISTS idx_news_chunks_article_id
+    ON news_chunks (news_article_id);
+CREATE INDEX IF NOT EXISTS idx_news_chunks_published_date
+    ON news_chunks (published_date DESC);
+
+CREATE OR REPLACE FUNCTION news_chunks_tsv_trigger() RETURNS TRIGGER AS $$
+BEGIN
+    NEW.content_tsv := to_tsvector('english', COALESCE(NEW.content, ''));
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trig_news_chunks_tsv ON news_chunks;
+CREATE TRIGGER trig_news_chunks_tsv
+    BEFORE INSERT OR UPDATE OF content ON news_chunks
+    FOR EACH ROW EXECUTE FUNCTION news_chunks_tsv_trigger();
+
+-- =============================================================================
+-- 9. earnings_transcripts
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS earnings_transcripts (
     id              BIGSERIAL   PRIMARY KEY,
@@ -315,7 +389,7 @@ CREATE INDEX IF NOT EXISTS idx_transcripts_year_quarter
     ON earnings_transcripts (fiscal_year, quarter);
 
 -- =============================================================================
--- 9. transcript_chunks
+-- 10. transcript_chunks
 -- =============================================================================
 CREATE TABLE IF NOT EXISTS transcript_chunks (
     id              BIGSERIAL   PRIMARY KEY,

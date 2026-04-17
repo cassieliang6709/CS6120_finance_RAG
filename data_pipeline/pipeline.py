@@ -74,7 +74,6 @@ from data_pipeline.config import (
     EMBEDDING_BATCH_SIZE,
     LOG_FILE,
     LOG_LEVEL,
-    TICKER_TO_SECTOR,
     YEARS,
 )
 from data_pipeline.downloaders.market_downloader import MarketDownloader
@@ -83,6 +82,7 @@ from data_pipeline.downloaders.news_downloader import NewsDownloader
 from data_pipeline.downloaders.sec_downloader import SECDownloader
 from data_pipeline.downloaders.transcript_downloader import TranscriptDownloader
 from data_pipeline.loaders.db_loader import DBLoader
+from data_pipeline.metadata import resolve_company_metadata
 from data_pipeline.processors.chunker import Chunker
 from data_pipeline.processors.embedder import Embedder
 from data_pipeline.processors.html_cleaner import HTMLCleaner
@@ -130,10 +130,14 @@ def _run_macro_stage() -> list[dict]:
     return rows
 
 
-def _run_news_stage(tickers: list[str]) -> list[dict]:
+def _run_news_stage(
+    tickers: list[str],
+    years: list[int],
+    official_only: bool = False,
+) -> list[dict]:
     """Download news articles."""
     logger.info("=== Stage: News download ===")
-    dl = NewsDownloader(tickers=tickers)
+    dl = NewsDownloader(tickers=tickers, years=years, official_only=official_only)
     rows = dl.download_all()
     logger.info("News stage complete: %d articles", len(rows))
     return rows
@@ -195,6 +199,7 @@ def _process_filings(
                 continue
 
             # Ensure filing row exists in DB
+            company_metadata = resolve_company_metadata(ticker)
             filing_row = {
                 "ticker": ticker,
                 "filing_type": filing_type,
@@ -207,6 +212,18 @@ def _process_filings(
 
             filing_id_map: dict[tuple, int] = {}
             if not skip_load:
+                loader.load_company(
+                    [
+                        {
+                            "ticker": ticker,
+                            "name": company_metadata["name"],
+                            "sector": company_metadata["sector"],
+                            "industry": company_metadata["industry"],
+                            "market_cap": company_metadata["market_cap"],
+                            "description": company_metadata["description"],
+                        }
+                    ]
+                )
                 filing_id_map = loader.load_filing([filing_row])
 
             filing_key = (ticker, filing_type, fiscal_year, period)
@@ -221,7 +238,7 @@ def _process_filings(
                 embeddings = [emb_array[i] for i in range(len(texts))]
 
             # Build chunk rows
-            sector = TICKER_TO_SECTOR.get(ticker, "unknown")
+            sector = company_metadata["sector"]
             chunk_rows = []
             for i, (section_name, chunk_text, token_count) in enumerate(raw_chunks):
                 chunk_rows.append(
@@ -245,6 +262,11 @@ def _process_filings(
 
             if not skip_load and chunk_rows:
                 loader.load_chunks(chunk_rows)
+                if filing_id is not None:
+                    loader.prune_chunks_for_filing(
+                        filing_id,
+                        [row["chunk_index"] for row in chunk_rows],
+                    )
 
             total_chunks += len(chunk_rows)
 
@@ -454,6 +476,11 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--skip-transcripts", action="store_true", help="Skip transcript download")
     p.add_argument("--skip-embed",       action="store_true", help="Skip embedding stage")
     p.add_argument("--skip-load",        action="store_true", help="Skip DB load (dry run)")
+    p.add_argument(
+        "--official-news-only",
+        action="store_true",
+        help="Use official company newsroom sources for news when supported",
+    )
     p.add_argument("--schema-only",      action="store_true", help="Run schema.sql and exit")
     p.add_argument(
         "--schema-path",
@@ -488,6 +515,7 @@ def main(argv: list[str] | None = None) -> None:
     skip_transcripts = args.skip_download or args.skip_transcripts
     skip_embed       = args.skip_embed
     skip_load        = args.skip_load
+    official_news_only = args.official_news_only
 
     logger.info("Starting Financial RAG Pipeline")
     logger.info("  Tickers      : %d", len(tickers))
@@ -530,14 +558,7 @@ def main(argv: list[str] | None = None) -> None:
             # so FK constraints on other tables are satisfied.
             if not skip_load:
                 stub_companies = [
-                    {
-                        "ticker": t,
-                        "name": t,
-                        "sector": TICKER_TO_SECTOR.get(t, "unknown"),
-                        "industry": None,
-                        "market_cap": None,
-                        "description": None,
-                    }
+                    resolve_company_metadata(t, {})
                     for t in tickers
                 ]
                 loader.load_company(stub_companies)
@@ -554,7 +575,7 @@ def main(argv: list[str] | None = None) -> None:
         # News
         # ----------------------------------------------------------------
         if not skip_news:
-            news_rows = _run_news_stage(tickers)
+            news_rows = _run_news_stage(tickers, years, official_only=official_news_only)
             if news_rows:
                 _process_news(news_rows, embedder, loader, skip_embed, skip_load)
 

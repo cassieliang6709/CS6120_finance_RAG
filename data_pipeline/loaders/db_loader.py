@@ -166,11 +166,17 @@ class DBLoader:
             INSERT INTO companies (ticker, name, sector, industry, market_cap, description, updated_at)
             VALUES (%(ticker)s, %(name)s, %(sector)s, %(industry)s, %(market_cap)s, %(description)s, NOW())
             ON CONFLICT (ticker) DO UPDATE SET
-                name        = EXCLUDED.name,
-                sector      = EXCLUDED.sector,
-                industry    = EXCLUDED.industry,
-                market_cap  = EXCLUDED.market_cap,
-                description = EXCLUDED.description,
+                name        = CASE
+                                WHEN EXCLUDED.name = EXCLUDED.ticker THEN companies.name
+                                ELSE EXCLUDED.name
+                              END,
+                sector      = CASE
+                                WHEN lower(COALESCE(EXCLUDED.sector, '')) IN ('', 'unknown') THEN companies.sector
+                                ELSE EXCLUDED.sector
+                              END,
+                industry    = COALESCE(EXCLUDED.industry, companies.industry),
+                market_cap  = COALESCE(EXCLUDED.market_cap, companies.market_cap),
+                description = COALESCE(EXCLUDED.description, companies.description),
                 updated_at  = NOW()
         """
         n = self._execute_batch(sql, rows)
@@ -251,7 +257,19 @@ class DBLoader:
                 %(section_name)s, %(chunk_index)s, %(content)s, %(char_count)s,
                 %(token_count)s, %(embedding)s, %(source_url)s
             )
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (filing_id, chunk_index) DO UPDATE SET
+                ticker      = EXCLUDED.ticker,
+                sector      = EXCLUDED.sector,
+                filing_type = EXCLUDED.filing_type,
+                fiscal_year = EXCLUDED.fiscal_year,
+                period      = EXCLUDED.period,
+                filed_date  = EXCLUDED.filed_date,
+                section_name = EXCLUDED.section_name,
+                content     = EXCLUDED.content,
+                char_count  = EXCLUDED.char_count,
+                token_count = EXCLUDED.token_count,
+                embedding   = EXCLUDED.embedding,
+                source_url  = EXCLUDED.source_url
         """
         # Ensure embeddings are numpy arrays
         normalised_rows = []
@@ -269,6 +287,30 @@ class DBLoader:
         n = self._execute_batch(sql, normalised_rows)
         logger.info("Loaded %d chunks", n)
         return n
+
+    def prune_chunks_for_filing(
+        self,
+        filing_id: int,
+        keep_chunk_indexes: Sequence[int],
+    ) -> int:
+        """
+        Remove stale chunk rows for a filing after a re-run produced a smaller
+        or reshaped chunk set.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM chunks
+                WHERE filing_id = %s
+                  AND NOT (chunk_index = ANY(%s))
+                """,
+                (filing_id, list(keep_chunk_indexes)),
+            )
+            deleted = cur.rowcount
+        self.conn.commit()
+        if deleted:
+            logger.info("Pruned %d stale chunks for filing_id=%s", deleted, filing_id)
+        return deleted
 
     # ------------------------------------------------------------------
     # 4. market_data
@@ -429,7 +471,52 @@ class DBLoader:
         return n
 
     # ------------------------------------------------------------------
-    # 8. earnings_transcripts
+    # 8. news_chunks
+    # ------------------------------------------------------------------
+
+    def load_news_chunks(self, rows: Sequence[Row]) -> int:
+        """
+        Upsert news chunks into ``news_chunks``.
+
+        Expected keys: news_article_id, ticker, published_date, source,
+                       chunk_index, content, token_count, source_url,
+                       embedding (numpy array or None).
+        """
+        sql = """
+            INSERT INTO news_chunks (
+                news_article_id, ticker, published_date, source,
+                chunk_index, content, token_count, source_url, embedding
+            )
+            VALUES (
+                %(news_article_id)s, %(ticker)s, %(published_date)s, %(source)s,
+                %(chunk_index)s, %(content)s, %(token_count)s, %(source_url)s,
+                %(embedding)s
+            )
+            ON CONFLICT (news_article_id, chunk_index) DO UPDATE SET
+                ticker         = EXCLUDED.ticker,
+                published_date = EXCLUDED.published_date,
+                source         = EXCLUDED.source,
+                content        = EXCLUDED.content,
+                token_count    = EXCLUDED.token_count,
+                source_url     = EXCLUDED.source_url,
+                embedding      = EXCLUDED.embedding
+        """
+        normalised_rows = []
+        for row in rows:
+            r = dict(row)
+            if r.get("embedding") is not None:
+                if not isinstance(r["embedding"], np.ndarray):
+                    r["embedding"] = np.array(r["embedding"], dtype=np.float32)
+                else:
+                    r["embedding"] = r["embedding"].astype(np.float32)
+            normalised_rows.append(r)
+
+        n = self._execute_batch(sql, normalised_rows)
+        logger.info("Loaded %d news_chunks rows", n)
+        return n
+
+    # ------------------------------------------------------------------
+    # 9. earnings_transcripts
     # ------------------------------------------------------------------
 
     def load_transcript(self, rows: Sequence[Row]) -> dict[tuple, int]:
@@ -477,7 +564,7 @@ class DBLoader:
         return id_map
 
     # ------------------------------------------------------------------
-    # 9. transcript_chunks
+    # 10. transcript_chunks
     # ------------------------------------------------------------------
 
     def load_transcript_chunks(self, rows: Sequence[Row]) -> int:
@@ -530,6 +617,7 @@ class DBLoader:
             "financials",
             "macro_indicators",
             "news_articles",
+            "news_chunks",
             "earnings_transcripts",
             "transcript_chunks",
         ]

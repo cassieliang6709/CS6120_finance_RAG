@@ -191,6 +191,36 @@ class HTMLCleaner:
             soup = BeautifulSoup(content, "html.parser")
         return soup
 
+    def _extract_primary_document(self, content: str | bytes) -> str | bytes:
+        """
+        When SEC filings are stored as ``full-submission.txt``, extract the main
+        filing document (the 10-K / 10-Q body) instead of parsing the entire
+        multi-document submission with exhibits attached.
+        """
+        if isinstance(content, bytes):
+            text = content.decode("utf-8", errors="ignore")
+        else:
+            text = content
+
+        if "<DOCUMENT>" not in text.upper():
+            return content
+
+        target_type = self.filing_type.upper()
+        document_blocks = re.findall(r"<DOCUMENT>(.*?)</DOCUMENT>", text, re.I | re.S)
+        for block in document_blocks:
+            type_match = re.search(r"<TYPE>\s*([^\n\r<]+)", block, re.I)
+            if not type_match:
+                continue
+            doc_type = type_match.group(1).strip().upper()
+            if doc_type != target_type:
+                continue
+
+            text_match = re.search(r"<TEXT>(.*)", block, re.I | re.S)
+            if text_match:
+                return text_match.group(1).strip()
+
+        return content
+
     def _strip_xbrl(self, soup: BeautifulSoup) -> None:
         """
         Remove XBRL-specific tags.  Tags in XBRL_TAGS_REMOVE are deleted
@@ -348,6 +378,8 @@ class HTMLCleaner:
             logger.error("Cannot read %s: %s", path, exc)
             return []
 
+        content = self._extract_primary_document(content)
+
         # Parse
         soup = self._load_soup(content)
 
@@ -367,6 +399,8 @@ class HTMLCleaner:
         # Split into sections
         sections = self._split_sections(text)
         sections = self._filter_sections(sections)
+        if not sections and len(text.strip()) >= self.min_section_length:
+            sections = [("Full Document", text.strip())]
 
         logger.debug(
             "Cleaned %s: %d sections, %d total chars",
@@ -384,6 +418,7 @@ class HTMLCleaner:
         if filing_type:
             self.filing_type = filing_type.upper()
 
+        raw_html = self._extract_primary_document(raw_html)
         soup = self._load_soup(raw_html)
         self._strip_xbrl(soup)
         self._strip_noise(soup)
@@ -394,7 +429,10 @@ class HTMLCleaner:
         text = self._remove_exhibit_index(text)
         text = self._strip_boilerplate_phrases(text)
 
-        return self._filter_sections(self._split_sections(text))
+        sections = self._filter_sections(self._split_sections(text))
+        if not sections and len(text.strip()) >= self.min_section_length:
+            sections = [("Full Document", text.strip())]
+        return sections
 
 
 # ---------------------------------------------------------------------------
