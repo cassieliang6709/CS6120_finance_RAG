@@ -31,8 +31,8 @@ Validation window:
 
 ## Current per-filing chunk counts
 
-- `AAPL 10-K`: 190
-- `AAPL 10-Q`: 62 / 68 / 64
+- `AAPL 10-K`: 95
+- `AAPL 10-Q`: 31 / 34 / 32
 - `JPM 10-K`: 606
 - `JPM 10-Q`: 299 / 381 / 389
 - `UNH 10-K`: 132

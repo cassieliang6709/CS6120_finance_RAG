@@ -1,6 +1,6 @@
 # CS 6120 Financial RAG Pipeline
 
-SEC filing retrieval-augmented generation system. Downloads 10-K/10-Q/8-K filings for 50 tickers (2019–2023), chunks and embeds the text, and loads everything into PostgreSQL with pgvector for hybrid (vector + full-text) retrieval.
+SEC filing retrieval-augmented generation system for a 50-ticker project universe. The current live snapshot includes local SEC 10-K/10-Q coverage for 29 tickers across 2018-2025, chunks and embeds the text, and loads everything into PostgreSQL with pgvector for hybrid (vector + full-text) retrieval.
 
 ## Quick start (Docker)
 
@@ -47,12 +47,21 @@ When running via Docker, `DATABASE_URL` is automatically set to `postgresql://po
 
 ## Database dump
 
-`financial_rag.dump` is a PostgreSQL custom-format dump (`pg_restore`-compatible). It contains the validated SEC corpus:
+`financial_rag.dump` is a PostgreSQL custom-format dump (`pg_restore`-compatible).
+It is intended to mirror the current live `financial_rag` database snapshot used
+for acceptance checks.
 
-- Tickers: `AAPL`, `JPM`, `UNH`, `XOM`
-- Year: 2023
-- Filing types: 10-K, 10-Q
-- Embeddings: included for all `chunks` rows (`384` dimensions, `all-MiniLM-L6-v2`)
+Current snapshot highlights:
+
+- Total rows across project tables: `155,536`
+- `filings` rows: `860`
+- `chunks` rows: `89,848`
+- Chunk embeddings: included for all `chunks` rows (`384` dimensions, `all-MiniLM-L6-v2`)
+- Company metadata in `v_chunk_search.company_name`: backfilled with display names instead of raw tickers
+- Validated SEC subset retained for `AAPL`, `JPM`, `UNH`, and `XOM` in 2023 (`10-K`, `10-Q`)
+- Full local SEC disk coverage is present for 29 tickers:
+  `AAPL`, `ABBV`, `AMZN`, `BAC`, `C`, `COP`, `COST`, `CVX`, `EOG`, `GOOGL`, `HD`, `JNJ`, `JPM`, `MCD`, `META`, `MRK`, `MSFT`, `NKE`, `NVDA`, `PFE`, `PNC`, `SBUX`, `SCHW`, `SLB`, `TFC`, `UNH`, `USB`, `WMT`, `XOM`
+- Local SEC year coverage currently spans `2018-2025` for those 29 tickers
 
 Docker automatically restores it via `init-db.sh` on first boot. To restore manually:
 
@@ -67,10 +76,13 @@ SELECT COUNT(*) AS total_chunks, COUNT(embedding) AS chunks_with_embedding
 FROM chunks;
 ```
 
+For retrieval and query-time metadata boosts, prefer `v_chunk_search.company_name`
+instead of reconstructing company names from tickers in application code.
+
 ## Backfilling embeddings for an existing database
 
-If you already restored an older dump or loaded SEC chunks without embeddings,
-you can backfill the missing vectors in place:
+If you already restored an older dump or loaded chunks without embeddings, you
+can backfill the missing vectors in place:
 
 ```bash
 .venv/bin/python -m data_pipeline.backfill_chunk_embeddings \
@@ -80,6 +92,21 @@ you can backfill the missing vectors in place:
 
 The script runs in offline Hugging Face mode by default and reuses the locally
 cached `sentence-transformers/all-MiniLM-L6-v2` model when available.
+
+If a dump contains ticker-only company names or unresolved sectors, repair the
+metadata in place:
+
+```bash
+.venv/bin/python data_pipeline/backfill_company_names.py
+psql -d financial_rag -f check_db_entries.sql
+```
+
+To backfill every local SEC 10-K / 10-Q filing already present on disk:
+
+```bash
+.venv/bin/python -m data_pipeline.backfill_local_sec_filings \
+  --db-url postgresql:///financial_rag
+```
 
 ## Running the pipeline locally
 

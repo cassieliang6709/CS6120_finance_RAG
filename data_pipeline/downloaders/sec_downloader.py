@@ -26,7 +26,6 @@ from data_pipeline.config import (
     SEC_DOWNLOAD_DIR,
     SEC_MAX_REQUESTS_PER_SECOND,
     SEC_USER_AGENT,
-    TICKER_TO_SECTOR,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,6 +92,24 @@ def _build_source_url(cik: str, accession: str) -> str:
         f"https://www.sec.gov/Archives/edgar/data/"
         f"{cik_clean}/{accession_clean}/{accession}-index.htm"
     )
+
+
+def _download_limit_for_range(filing_type: str, years: list[int]) -> int:
+    """
+    Estimate a safe SEC download limit for the requested filing window.
+
+    ``sec-edgar-downloader`` truncates results at ``limit`` per
+    ticker/filing-type request. For multi-year 10-Q backfills, a hard-coded
+    limit of 20 silently misses filings once the window exceeds roughly
+    6 years. We intentionally over-allocate here so 2018-2025 local backfills
+    collect the full on-disk set in one pass.
+    """
+    year_count = max(1, len(set(years)))
+    if filing_type == "10-Q":
+        return max(20, year_count * 4 + 4)
+    if filing_type == "10-K":
+        return max(20, year_count * 2 + 2)
+    return max(20, year_count * 8)
 
 
 def _parse_submission_metadata(accession_dir: Path) -> dict[str, str]:
@@ -290,7 +307,13 @@ class SECDownloader:
                 logger.info(
                     "[%d/%d] Downloading %s %s", processed, total, ticker, filing_type
                 )
-                self._download_one(ticker, filing_type, after_date, before_date)
+                self._download_one(
+                    ticker,
+                    filing_type,
+                    after_date,
+                    before_date,
+                    limit=_download_limit_for_range(filing_type, years),
+                )
 
         # Collect metadata for everything on disk (current run + prior runs)
         return self._collect_metadata(tickers, filing_types, years)
