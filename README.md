@@ -43,6 +43,11 @@ The `pipeline` service is commented out in `docker-compose.yml`. Run the pipelin
 It is intended to mirror the current live `financial_rag` database snapshot used
 for acceptance checks.
 
+The repository version of `financial_rag.dump` is tracked with Git LFS, since
+the final snapshot is too large for normal Git storage. For class handoff, the
+same dump can also be shared separately through Google Drive when direct file
+download is more convenient than cloning the repository with LFS enabled.
+
 Current snapshot highlights:
 
 - Total rows across project tables: `228,573`
@@ -58,11 +63,6 @@ Current snapshot highlights:
 - Validated SEC subset retained for `AAPL`, `JPM`, `UNH`, and `XOM` in 2023 (`10-K`, `10-Q`)
 - Full local SEC disk coverage is present for all 50 project tickers
 - Local SEC year coverage spans `2018-2025`
-
-The repository root also contains a dated snapshot,
-`financial_rag_2026-04-18_50tickers.dump`, which is the portable handoff copy
-of the same final database. The dump is approximately `540 MB`, so for class
-handoff it is better shared via Google Drive rather than committed to GitHub.
 
 Docker automatically restores it via `init-db.sh` on first boot. To restore manually:
 
