@@ -1,6 +1,6 @@
 # CS 6120 Financial RAG Pipeline
 
-SEC filing retrieval-augmented generation system for a 50-ticker project universe. The current live snapshot includes local SEC 10-K/10-Q coverage for 29 tickers across 2018-2025, chunks and embeds the text, and loads everything into PostgreSQL with pgvector for hybrid (vector + full-text) retrieval.
+SEC filing retrieval-augmented generation system for a 50-ticker project universe. The current live snapshot includes local SEC 10-K/10-Q coverage for all 50 project tickers across 2018-2025, chunks and embeds the text, and loads everything into PostgreSQL with pgvector for hybrid (vector + full-text) retrieval.
 
 ## Quick start (Docker)
 
@@ -45,20 +45,30 @@ for acceptance checks.
 
 Current snapshot highlights:
 
-- Total rows across project tables: `155,536`
-- `filings` rows: `860`
-- `chunks` rows: `89,848`
+- Total rows across project tables: `228,573`
+- `companies` rows: `50`
+- `filings` rows: `1,511`
+- `chunks` rows: `162,234`
 - Chunk embeddings: included for all `chunks` rows (`384` dimensions, `all-MiniLM-L6-v2`)
+- Chunk embeddings missing: `0`
 - Company metadata in `v_chunk_search.company_name`: backfilled with display names instead of raw tickers
+- Unresolved company sectors: `0`
+- Unresolved chunk sectors: `0`
+- Ticker-like company names in `v_chunk_search`: `0`
 - Validated SEC subset retained for `AAPL`, `JPM`, `UNH`, and `XOM` in 2023 (`10-K`, `10-Q`)
-- Full local SEC disk coverage is present for 29 tickers:
-  `AAPL`, `ABBV`, `AMZN`, `BAC`, `C`, `COP`, `COST`, `CVX`, `EOG`, `GOOGL`, `HD`, `JNJ`, `JPM`, `MCD`, `META`, `MRK`, `MSFT`, `NKE`, `NVDA`, `PFE`, `PNC`, `SBUX`, `SCHW`, `SLB`, `TFC`, `UNH`, `USB`, `WMT`, `XOM`
-- Local SEC year coverage currently spans `2018-2025` for those 29 tickers
+- Full local SEC disk coverage is present for all 50 project tickers
+- Local SEC year coverage spans `2018-2025`
+
+The repository root also contains a dated snapshot,
+`financial_rag_2026-04-18_50tickers.dump`, which is the portable handoff copy
+of the same final database. The dump is approximately `540 MB`, so for class
+handoff it is better shared via Google Drive rather than committed to GitHub.
 
 Docker automatically restores it via `init-db.sh` on first boot. To restore manually:
 
 ```bash
-pg_restore -U postgres -d financial_rag financial_rag.dump
+createdb financial_rag
+pg_restore --clean --if-exists --no-owner -d financial_rag financial_rag.dump
 ```
 
 To verify embedding coverage after restore:
@@ -306,4 +316,3 @@ retrieval container  ──┬──▶ asyncpg → Postgres + pgvector  (local 
 
 The HPC ngrok URL is **never exposed to end users** — only the retrieval
 container reads it, as a backend env var.
-

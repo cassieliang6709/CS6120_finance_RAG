@@ -22,8 +22,8 @@ from data_pipeline.config import (
     ALL_TICKERS,
     END_DATE,
     START_DATE,
-    TICKER_TO_SECTOR,
 )
+from data_pipeline.metadata import resolve_company_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -123,23 +123,25 @@ class MarketDownloader:
         try:
             tkr = yf.Ticker(ticker)
             info = tkr.info or {}
+            metadata = resolve_company_metadata(ticker, info)
             return {
                 "ticker": ticker,
-                "name": info.get("longName") or info.get("shortName") or ticker,
-                "sector": TICKER_TO_SECTOR.get(ticker, info.get("sector", "Unknown")),
-                "industry": info.get("industry"),
+                "name": metadata["name"],
+                "sector": metadata["sector"],
+                "industry": metadata["industry"],
                 "market_cap": _safe_float(info.get("marketCap")),
-                "description": info.get("longBusinessSummary"),
+                "description": metadata["description"],
             }
         except Exception as exc:
             logger.warning("Could not fetch info for %s: %s", ticker, exc)
+            metadata = resolve_company_metadata(ticker, {})
             return {
                 "ticker": ticker,
-                "name": ticker,
-                "sector": TICKER_TO_SECTOR.get(ticker, "Unknown"),
-                "industry": None,
+                "name": metadata["name"],
+                "sector": metadata["sector"],
+                "industry": metadata["industry"],
                 "market_cap": None,
-                "description": None,
+                "description": metadata["description"],
             }
 
     # ------------------------------------------------------------------

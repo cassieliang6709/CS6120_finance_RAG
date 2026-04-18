@@ -1,21 +1,23 @@
 """
-News downloader (RSS feeds)
-=============================
-Fetches financial news for each ticker from:
-  - Yahoo Finance RSS: https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}
-  - Reuters RSS (market news): https://feeds.reuters.com/reuters/businessNews
+News downloader
+================
+Fetches financial news from a mix of sources:
+  - Official company newsroom sources when available
+  - Yahoo Finance RSS
+  - Reuters RSS
 
-Articles are deduplicated by URL.  Content and title are combined for embedding.
+Articles are deduplicated by URL. Content and title are combined for embedding.
 """
 
 from __future__ import annotations
 
-import hashlib
 import logging
+import re
 import time
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urljoin
 
 import feedparser
 import requests
@@ -37,6 +39,26 @@ REUTERS_RSS_FEEDS = [
     "https://feeds.reuters.com/reuters/businessNews",
     "https://feeds.reuters.com/reuters/companyNews",
 ]
+
+OFFICIAL_NEWSROOM_SOURCES: dict[str, dict[str, Any]] = {
+    "AAPL": {
+        "kind": "rss",
+        "url": "https://www.apple.com/newsroom/rss-feed.rss",
+        "source": "apple_newsroom",
+    },
+    "UNH": {
+        "kind": "listing",
+        "url": "https://www.unitedhealthgroup.com/newsroom/news.html?contenttype=press-release",
+        "source": "unitedhealthgroup_newsroom",
+        "article_path_pattern": re.compile(r"^/newsroom/(?:posts/)?(20\d{2})/"),
+    },
+    "XOM": {
+        "kind": "listing",
+        "url": "https://corporate.exxonmobil.com/news/news-releases",
+        "source": "exxonmobil_newsroom",
+        "article_path_pattern": re.compile(r"^/news/news-releases/(20\d{2})/"),
+    },
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -66,6 +88,80 @@ def _clean_html(html_text: str) -> str:
         return soup.get_text(separator=" ", strip=True)
     except Exception:
         return html_text
+
+
+def _normalise_datetime(value: datetime | None) -> datetime | None:
+    """Return a timezone-aware UTC datetime when possible."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _extract_year_from_url(url: str) -> int | None:
+    """Extract a 4-digit year from a newsroom-style URL."""
+    match = re.search(r"/(20\d{2})/", url)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+def _extract_published_from_soup(soup: BeautifulSoup) -> datetime | None:
+    """Extract article published datetime from metadata or <time> tags."""
+    meta_candidates = [
+        ("meta", {"property": "article:published_time"}, "content"),
+        ("meta", {"name": "article:published_time"}, "content"),
+        ("meta", {"property": "og:published_time"}, "content"),
+        ("meta", {"name": "publish-date"}, "content"),
+        ("meta", {"name": "date"}, "content"),
+    ]
+    for tag_name, attrs, attr_name in meta_candidates:
+        tag = soup.find(tag_name, attrs=attrs)
+        if tag and tag.get(attr_name):
+            raw = str(tag.get(attr_name)).strip()
+            try:
+                return _normalise_datetime(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+            except ValueError:
+                try:
+                    return _normalise_datetime(parsedate_to_datetime(raw))
+                except Exception:
+                    pass
+
+    time_tag = soup.find("time", attrs={"datetime": True})
+    if time_tag and time_tag.get("datetime"):
+        raw = str(time_tag.get("datetime")).strip()
+        try:
+            return _normalise_datetime(datetime.fromisoformat(raw.replace("Z", "+00:00")))
+        except ValueError:
+            try:
+                return _normalise_datetime(parsedate_to_datetime(raw))
+            except Exception:
+                return None
+    return None
+
+
+def _extract_article_text(soup: BeautifulSoup) -> str:
+    """Extract the article body from a newsroom page."""
+    body = soup.find("article") or soup.find("main") or soup.body or soup
+    for tag in body.find_all(["nav", "aside", "footer", "script", "style", "noscript", "form"]):
+        tag.decompose()
+
+    paragraphs: list[str] = []
+    for tag in body.find_all(["p", "li"]):
+        text = " ".join(tag.get_text(" ", strip=True).split())
+        if text and len(text) >= 40:
+            paragraphs.append(text)
+
+    # Keep order but drop exact duplicates that often appear in sticky/mobile UI.
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for text in paragraphs:
+        if text in seen:
+            continue
+        seen.add(text)
+        deduped.append(text)
+    return "\n\n".join(deduped)
 
 
 def _entry_to_row(entry: Any, ticker: str | None, source: str) -> NewsRow | None:
@@ -128,29 +224,46 @@ class NewsDownloader:
     def __init__(
         self,
         tickers: list[str] | None = None,
+        years: list[int] | None = None,
         request_delay: float = REQUEST_DELAY_SECONDS,
         timeout: int = REQUEST_TIMEOUT,
         include_reuters: bool = True,
+        official_only: bool = False,
     ) -> None:
         self.tickers = tickers or ALL_TICKERS
+        self.years = set(years or [])
         self.request_delay = request_delay
         self.timeout = timeout
         self.include_reuters = include_reuters
+        self.official_only = official_only
         self._seen_urls: set[str] = set()
 
     # ------------------------------------------------------------------
     # Internal fetch
     # ------------------------------------------------------------------
 
-    def _fetch_feed(self, url: str) -> feedparser.FeedParserDict:
-        """Fetch and parse an RSS feed URL, returning a feedparser dict."""
+    def _fetch_url(self, url: str) -> requests.Response | None:
+        """Fetch a URL and return the response on success."""
         try:
             resp = requests.get(url, timeout=self.timeout)
             resp.raise_for_status()
-            return feedparser.parse(resp.content)
+            return resp
         except requests.RequestException as exc:
-            logger.warning("Failed to fetch RSS feed %s: %s", url, exc)
+            logger.warning("Failed to fetch %s: %s", url, exc)
+            return None
+
+    def _fetch_feed(self, url: str) -> feedparser.FeedParserDict:
+        """Fetch and parse an RSS feed URL, returning a feedparser dict."""
+        resp = self._fetch_url(url)
+        if resp is None:
             return feedparser.FeedParserDict()
+        return feedparser.parse(resp.content)
+
+    def _year_allowed(self, year: int | None) -> bool:
+        """Return True when a row should be kept for the configured years."""
+        if year is None or not self.years:
+            return True
+        return year in self.years
 
     def _process_feed(
         self,
@@ -164,11 +277,141 @@ class NewsDownloader:
             row = _entry_to_row(entry, ticker, source)
             if row is None:
                 continue
+            published = _normalise_datetime(row.get("published_date"))
+            if not self._year_allowed(published.year if published else _extract_year_from_url(row["source_url"])):
+                continue
+            row["published_date"] = published
             url = row["source_url"]
             if url in self._seen_urls:
                 continue
             self._seen_urls.add(url)
             rows.append(row)
+        return rows
+
+    def _extract_official_article_row(
+        self,
+        ticker: str,
+        article_url: str,
+        source: str,
+        fallback_title: str = "",
+    ) -> NewsRow | None:
+        """Fetch one official newsroom article and convert it to a NewsRow."""
+        resp = self._fetch_url(article_url)
+        if resp is None:
+            return None
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        title = ""
+        for attrs in (
+            {"property": "og:title"},
+            {"name": "twitter:title"},
+        ):
+            meta = soup.find("meta", attrs=attrs)
+            if meta and meta.get("content"):
+                title = str(meta.get("content")).strip()
+                break
+        if not title:
+            title_tag = soup.find("title")
+            if title_tag:
+                title = " ".join(title_tag.get_text(" ", strip=True).split())
+        if not title:
+            title = fallback_title
+
+        summary = ""
+        for attrs in (
+            {"property": "og:description"},
+            {"name": "description"},
+            {"name": "twitter:description"},
+        ):
+            meta = soup.find("meta", attrs=attrs)
+            if meta and meta.get("content"):
+                summary = _clean_html(str(meta.get("content")).strip())
+                break
+
+        published = _extract_published_from_soup(soup)
+        if not self._year_allowed(published.year if published else _extract_year_from_url(article_url)):
+            return None
+
+        content = _extract_article_text(soup)
+        if not title or not content:
+            return None
+
+        return {
+            "ticker": ticker,
+            "title": title,
+            "content": content,
+            "summary": summary,
+            "author": None,
+            "published_date": published,
+            "source_url": article_url,
+            "source": source,
+            "embedding": None,
+        }
+
+    def _extract_links_from_listing(
+        self,
+        listing_url: str,
+        article_path_pattern: re.Pattern[str],
+    ) -> list[tuple[str, str]]:
+        """Extract matching article links from an official newsroom listing page."""
+        resp = self._fetch_url(listing_url)
+        if resp is None:
+            return []
+
+        soup = BeautifulSoup(resp.text, "lxml")
+        links: list[tuple[str, str]] = []
+        seen_urls: set[str] = set()
+        for anchor in soup.find_all("a", href=True):
+            href = str(anchor["href"]).strip()
+            text = " ".join(anchor.get_text(" ", strip=True).split())
+            if not href or not text:
+                continue
+            if not article_path_pattern.match(href):
+                continue
+            full_url = urljoin(listing_url, href)
+            year = _extract_year_from_url(full_url)
+            if not self._year_allowed(year):
+                continue
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            links.append((full_url, text))
+        return links
+
+    # ------------------------------------------------------------------
+    # Official company newsroom sources
+    # ------------------------------------------------------------------
+
+    def fetch_official_news(self, ticker: str) -> list[NewsRow]:
+        """Fetch official newsroom items for one ticker when supported."""
+        config = OFFICIAL_NEWSROOM_SOURCES.get(ticker)
+        if config is None:
+            return []
+
+        source = str(config["source"])
+        rows: list[NewsRow] = []
+
+        if config["kind"] == "rss":
+            feed = self._fetch_feed(str(config["url"]))
+            rows = self._process_feed(feed, ticker, source)
+            logger.debug("Official newsroom RSS for %s: %d new articles", ticker, len(rows))
+            return rows
+
+        listing_links = self._extract_links_from_listing(
+            str(config["url"]),
+            config["article_path_pattern"],
+        )
+        for article_url, title in listing_links:
+            if article_url in self._seen_urls:
+                continue
+            row = self._extract_official_article_row(ticker, article_url, source, fallback_title=title)
+            if row is None:
+                continue
+            self._seen_urls.add(article_url)
+            rows.append(row)
+            time.sleep(self.request_delay)
+
+        logger.debug("Official newsroom listing for %s: %d new articles", ticker, len(rows))
         return rows
 
     # ------------------------------------------------------------------
@@ -215,15 +458,21 @@ class NewsDownloader:
         all_rows: list[NewsRow] = []
         self._seen_urls.clear()
 
-        # Ticker-specific Yahoo Finance news
         for i, ticker in enumerate(self.tickers, 1):
-            logger.info("[%d/%d] Fetching Yahoo news for %s", i, len(self.tickers), ticker)
-            rows = self.fetch_yahoo_news(ticker)
-            all_rows.extend(rows)
+            official_rows = self.fetch_official_news(ticker)
+            if official_rows:
+                logger.info("[%d/%d] Fetched %d official news items for %s", i, len(self.tickers), len(official_rows), ticker)
+                all_rows.extend(official_rows)
+            elif self.official_only:
+                logger.info("[%d/%d] No supported official newsroom source for %s", i, len(self.tickers), ticker)
+            else:
+                logger.info("[%d/%d] Fetching Yahoo news for %s", i, len(self.tickers), ticker)
+                rows = self.fetch_yahoo_news(ticker)
+                all_rows.extend(rows)
             time.sleep(self.request_delay)
 
         # Reuters
-        if self.include_reuters:
+        if self.include_reuters and not self.official_only:
             logger.info("Fetching Reuters RSS feeds")
             rows = self.fetch_reuters_news()
             all_rows.extend(rows)
@@ -242,10 +491,17 @@ class NewsDownloader:
 
 def download_news(
     tickers: list[str] | None = None,
+    years: list[int] | None = None,
     include_reuters: bool = True,
+    official_only: bool = False,
 ) -> list[NewsRow]:
     """Shorthand for ``NewsDownloader().download_all()``."""
-    dl = NewsDownloader(tickers=tickers, include_reuters=include_reuters)
+    dl = NewsDownloader(
+        tickers=tickers,
+        years=years,
+        include_reuters=include_reuters,
+        official_only=official_only,
+    )
     return dl.download_all()
 
 
@@ -255,7 +511,7 @@ def download_news(
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    articles = download_news(tickers=["AAPL", "MSFT"])
+    articles = download_news(tickers=["AAPL", "UNH", "XOM"], years=[2024, 2025, 2026], official_only=True)
     print(f"Downloaded {len(articles)} articles")
     for a in articles[:3]:
         print(f"  [{a['ticker']}] {a['title']} ({a['published_date']})")

@@ -13,6 +13,10 @@ TEST_DATABASE_URL = os.getenv(
     os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/financial_rag"),
 )
 
+SEC_TICKER_ALIASES = {
+    "0001038357": "PXD",
+}
+
 
 class DatabaseAcceptanceTests(unittest.TestCase):
     @classmethod
@@ -141,10 +145,14 @@ class DatabaseAcceptanceTests(unittest.TestCase):
 
     def test_local_sec_disk_coverage_is_complete(self) -> None:
         local_root = Path(SEC_DOWNLOAD_DIR) / "sec-edgar-filings"
-        local_tickers = sorted(path.name for path in local_root.iterdir() if path.is_dir())
+        local_dirs = sorted(path.name for path in local_root.iterdir() if path.is_dir())
         years = list(range(2018, 2026))
-        local_metas = SECDownloader()._collect_metadata(local_tickers, ["10-K", "10-Q"], years)
-        local_keys = {(ticker, filing_type, fiscal_year, period) for ticker, filing_type, fiscal_year, period, *_ in local_metas}
+        local_metas = SECDownloader()._collect_metadata(local_dirs, ["10-K", "10-Q"], years)
+        local_keys = {
+            (SEC_TICKER_ALIASES.get(ticker, ticker), filing_type, fiscal_year, period)
+            for ticker, filing_type, fiscal_year, period, *_ in local_metas
+        }
+        local_tickers = sorted({SEC_TICKER_ALIASES.get(ticker, ticker) for ticker in local_dirs})
 
         with self.conn.cursor() as cur:
             cur.execute(
