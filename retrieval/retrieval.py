@@ -16,6 +16,10 @@ _company_name_to_ticker: dict[str, str] = {}
 
 _TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
 _YEAR_RE = re.compile(r"(?:FY|fiscal\s+year\s*)?(20\d{2})", re.IGNORECASE)
+_QUARTER_RE = re.compile(
+    r"\b(?:q[1-4]|quarter(?:ly)?|first quarter|second quarter|third quarter|fourth quarter)\b",
+    re.IGNORECASE,
+)
 _FILING_TYPE_PATTERNS: dict[str, re.Pattern] = {
     "10-K": re.compile(r"\b10-k\b|\bannual report\b|\bannual filing\b", re.IGNORECASE),
     "10-Q": re.compile(r"\b10-q\b|\bquarterly report\b|\bquarterly filing\b", re.IGNORECASE),
@@ -65,10 +69,20 @@ def detect_company_in_query(query: str) -> Optional[str]:
 
 
 def detect_filing_type_in_query(query: str) -> Optional[str]:
-    """Return '10-K' or '10-Q' if the query mentions a specific filing type."""
+    """Infer the filing type from the query text when the intent is clear.
+
+    Rules:
+    - Explicit mentions like "10-K" or "quarterly report" win.
+    - Quarter-specific questions default to 10-Q.
+    - FY/annual-year questions default to 10-K unless they also mention a quarter.
+    """
     for filing_type, pattern in _FILING_TYPE_PATTERNS.items():
         if pattern.search(query):
             return filing_type
+    if _QUARTER_RE.search(query):
+        return "10-Q"
+    if _YEAR_RE.search(query):
+        return "10-K"
     return None
 
 
@@ -245,12 +259,14 @@ async def retrieve(
 ) -> list[ChunkResult]:
     overfetch = k * 3
     query_vec = embed_query(query)
-    filter_where, filter_params = build_filter_clause(sector, company, filing_type)
+    inferred_filing_type = None if filing_type else detect_filing_type_in_query(query)
+    effective_filing_type = filing_type or inferred_filing_type
+    filter_where, filter_params = build_filter_clause(sector, company, effective_filing_type)
 
     # Detect signals before retrieval so boosts are embedded in SQL ORDER BY,
     # affecting which chunks the DB returns rather than just reordering them after.
     boost_ticker = None if company else detect_company_in_query(query)
-    boost_filing_type = None if filing_type else detect_filing_type_in_query(query)
+    boost_filing_type = None if effective_filing_type else inferred_filing_type
     boost_year = detect_year_in_query(query)
 
     vec_rows, bm25_rows = await asyncio.gather(
