@@ -17,7 +17,12 @@ import pytest_asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from retrieval import minmax_normalize, fuse_scores, build_filter_clause
+from retrieval import (
+    build_filter_clause,
+    detect_filing_type_in_query,
+    fuse_scores,
+    minmax_normalize,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -71,6 +76,20 @@ def test_build_filter_clause_all_filters():
     assert "ticker = :company" in where
     assert "filing_type = :filing_type" in where
     assert params == {"sector": "banking", "company": "JPM", "filing_type": "10-K"}
+
+
+def test_detect_filing_type_in_query_explicit_10q():
+    assert detect_filing_type_in_query("Use the latest 10-Q for Amazon revenue.") == "10-Q"
+
+
+def test_detect_filing_type_in_query_fy_defaults_to_10k():
+    query = "What is Amazon's FY2019 net income attributable to shareholders?"
+    assert detect_filing_type_in_query(query) == "10-K"
+
+
+def test_detect_filing_type_in_query_quarter_defaults_to_10q():
+    query = "What was Amazon's Q2 2019 net income?"
+    assert detect_filing_type_in_query(query) == "10-Q"
 
 
 # ─── Integration Tests ─────────────────────────────────────────────────────────

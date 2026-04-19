@@ -10,7 +10,13 @@ from sse_starlette.sse import EventSourceResponse
 import config
 from chat import chat_once, stream_chat
 from db import close_pool, get_pool
-from models import ChatRequest, ChatResponse, RetrieveRequest, RetrieveResponse
+from models import (
+    ChatRequest,
+    ChatResponse,
+    FilterOptionsResponse,
+    RetrieveRequest,
+    RetrieveResponse,
+)
 from retrieval import load_known_tickers, retrieve
 
 
@@ -47,6 +53,42 @@ async def require_api_key(
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
+
+@app.get("/filters", response_model=FilterOptionsResponse)
+async def filters_endpoint():
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        companies = await conn.fetch(
+            """
+            SELECT DISTINCT ticker
+            FROM filings
+            WHERE ticker IS NOT NULL AND ticker <> ''
+            ORDER BY ticker
+            """
+        )
+        filing_types = await conn.fetch(
+            """
+            SELECT DISTINCT filing_type
+            FROM filings
+            WHERE filing_type IS NOT NULL AND filing_type <> ''
+            ORDER BY filing_type
+            """
+        )
+        fiscal_years = await conn.fetch(
+            """
+            SELECT DISTINCT fiscal_year
+            FROM filings
+            WHERE fiscal_year IS NOT NULL
+            ORDER BY fiscal_year DESC
+            """
+        )
+
+    return FilterOptionsResponse(
+        companies=[row["ticker"] for row in companies],
+        filing_types=[row["filing_type"] for row in filing_types],
+        fiscal_years=[row["fiscal_year"] for row in fiscal_years],
+    )
 
 
 @app.post("/retrieve", response_model=RetrieveResponse)

@@ -29,6 +29,12 @@ class RetrieveResponse(BaseModel):
     chunks: list[ChunkResult]
 
 
+class FilterOptionsResponse(BaseModel):
+    companies: list[str]
+    filing_types: list[str]
+    fiscal_years: list[int]
+
+
 class ChatRequest(BaseModel):
     query: str = Field(..., min_length=1)
     k: int = Field(default=5, ge=1, le=20)
