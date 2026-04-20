@@ -17,7 +17,7 @@ _company_name_to_ticker: dict[str, str] = {}
 _ticker_to_company_names: dict[str, set[str]] = {}
 
 _TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
-_YEAR_RE = re.compile(r"\b(20\d{2})\b")
+_YEAR_RE = re.compile(r"(?:\bFY\s*|\b)(20\d{2})\b", re.IGNORECASE)
 _YEAR_RANGE_RE = re.compile(r"\b(20\d{2})\s*(?:-|–|to)\s*(20\d{2})\b", re.IGNORECASE)
 _FISCAL_YEAR_RE = re.compile(r"\b(?:FY\s*20\d{2}|fiscal\s+year\s*20\d{2})\b", re.IGNORECASE)
 _ANNUAL_HINT_RE = re.compile(
@@ -531,8 +531,10 @@ async def retrieve(
                 text=row["text"],
                 score=round(score, 6),
                 company=row["company"],
+                company_name=row.get("company_name"),
                 sector=row["sector"],
                 filing_type=ft,
+                fiscal_year=row.get("fiscal_year"),
                 filed_date=row.get("filed_date"),
                 source_url=row.get("source_url"),
                 article_title=_compose_article_title(row) or None,

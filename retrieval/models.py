@@ -18,8 +18,10 @@ class ChunkResult(BaseModel):
     text: str
     score: float
     company: str
+    company_name: Optional[str] = None
     sector: Optional[str] = None
     filing_type: Optional[str] = None
+    fiscal_year: Optional[int] = None
     filed_date: Optional[date] = None
     source_url: Optional[str] = None
     article_title: Optional[str] = None
