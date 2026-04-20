@@ -30,3 +30,9 @@ API_KEY: str = os.getenv("API_KEY", "")
 CORS_ORIGINS: list[str] = [
     o.strip() for o in os.getenv("CORS_ORIGINS", "*").split(",") if o.strip()
 ]
+
+# Boost multiplier applied to chunks whose ticker matches a company detected in the query.
+# Set to 1.0 to disable.
+COMPANY_BOOST: float = float(os.getenv("COMPANY_BOOST", "1.5"))
+FILING_TYPE_BOOST: float = float(os.getenv("FILING_TYPE_BOOST", "1.3"))
+FISCAL_YEAR_BOOST: float = float(os.getenv("FISCAL_YEAR_BOOST", "1.3"))

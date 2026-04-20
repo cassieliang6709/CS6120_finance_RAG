@@ -17,7 +17,14 @@ import pytest_asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from retrieval import minmax_normalize, fuse_scores, build_filter_clause
+from retrieval import (
+    build_filter_clause,
+    detect_filing_type_in_query,
+    detect_filing_type_hint_in_query,
+    detect_years_in_query,
+    fuse_scores,
+    minmax_normalize,
+)
 
 pytestmark = pytest.mark.anyio
 
@@ -71,6 +78,80 @@ def test_build_filter_clause_all_filters():
     assert "ticker = :company" in where
     assert "filing_type = :filing_type" in where
     assert params == {"sector": "banking", "company": "JPM", "filing_type": "10-K"}
+
+
+def test_detect_filing_type_in_query_explicit_10q():
+    assert detect_filing_type_in_query("Use the latest 10-Q for Amazon revenue.") == "10-Q"
+
+
+def test_detect_filing_type_in_query_supports_unhyphenated_10k():
+    assert detect_filing_type_in_query("Use the latest 10k for Amazon revenue.") == "10-K"
+
+
+def test_detect_filing_type_in_query_supports_form_alias():
+    assert detect_filing_type_in_query("Summarize Form 10-K risk factors for Amazon.") == "10-K"
+
+
+def test_detect_filing_type_in_query_supports_year_end_alias():
+    assert detect_filing_type_in_query("What did the year-end report say about liquidity?") == "10-K"
+
+
+def test_detect_filing_type_in_query_supports_q_report_alias():
+    assert detect_filing_type_in_query("What did the Q1 report say about margins?") == "10-Q"
+
+
+def test_detect_filing_type_in_query_fy_is_not_treated_as_explicit():
+    query = "What is Amazon's FY2019 net income attributable to shareholders?"
+    assert detect_filing_type_in_query(query) is None
+
+
+def test_detect_filing_type_in_query_quarter_hint_is_not_treated_as_explicit():
+    query = "What was Amazon's Q2 2019 net income?"
+    assert detect_filing_type_in_query(query) is None
+
+
+def test_detect_filing_type_in_query_returns_none_for_ambiguous_explicit_mentions():
+    query = "Compare Amazon's 10-K and 10-Q disclosures for 2023."
+    assert detect_filing_type_in_query(query) is None
+
+
+def test_detect_filing_type_hint_in_query_fy_defaults_to_10k():
+    query = "What is Amazon's FY2019 net income attributable to shareholders?"
+    assert detect_filing_type_hint_in_query(query) == "10-K"
+
+
+def test_detect_filing_type_hint_in_query_quarter_defaults_to_10q():
+    query = "What was Amazon's Q2 2019 net income?"
+    assert detect_filing_type_hint_in_query(query) == "10-Q"
+
+
+def test_detect_filing_type_hint_in_query_returns_none_for_ambiguous_hints():
+    query = "Compare annual and quarterly trends for Amazon."
+    assert detect_filing_type_hint_in_query(query) is None
+
+
+def test_detect_filing_type_hint_in_query_does_not_treat_bare_year_as_10k():
+    query = "What changed for Amazon in 2023?"
+    assert detect_filing_type_hint_in_query(query) is None
+
+
+def test_detect_years_in_query_single_year():
+    assert detect_years_in_query("What changed for Amazon in 2023?") == ["2023"]
+
+
+def test_detect_years_in_query_expands_ranges():
+    query = "Compare Amazon revenue from 2020-2022."
+    assert detect_years_in_query(query) == ["2020", "2021", "2022"]
+
+
+def test_detect_years_in_query_supports_to_ranges():
+    query = "Compare Amazon revenue from 2020 to 2022."
+    assert detect_years_in_query(query) == ["2020", "2021", "2022"]
+
+
+def test_detect_years_in_query_deduplicates_overlapping_mentions():
+    query = "Compare 2020-2022 and 2021 results."
+    assert detect_years_in_query(query) == ["2020", "2021", "2022"]
 
 
 # ─── Integration Tests ─────────────────────────────────────────────────────────
