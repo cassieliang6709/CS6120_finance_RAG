@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
-"""Evaluate end-to-end RAG chat against the FinanceBench intersection dataset.
+"""Evaluate end-to-end RAG chat against a filtered FinanceBench dataset.
 
-This script reads benchmark questions from the base FinanceBench intersection
-JSON, calls the live `/chat` endpoint (which performs retrieval internally),
-and writes a new JSON file that preserves the original benchmark rows while
-adding:
+This script reads benchmark questions from a filtered FinanceBench JSON file,
+calls the live `/chat` endpoint once per question with `stream=false`, and
+writes a new JSON file that preserves the original benchmark rows while adding:
 
-- `retrieved_chunks`: chunks returned by `/chat` for this run
-- `rag_chat`: status, error, response, and latency metadata
+- `retrieved_chunks`
+- `final_reasoning`
+- `final_answer`
+- `latency_ms`
+- `status`
+- `error`
 """
 
 from __future__ import annotations
@@ -22,21 +25,26 @@ from urllib import error, request
 
 DEFAULT_DATASET = (
     "evaluation/financebench_filtered/"
-    "financebench_filtered_db_company_intersection.json"
+    "financebench_filtered_overlap_10_companies_10k_10q_2018_2023.json"
 )
 DEFAULT_OUTPUT = (
     "evaluation/financebench_filtered/"
-    "financebench_filtered_db_company_intersection_with_rag_chat.json"
+    "financebench_filtered_overlap_10_companies_10k_10q_2018_2023_with_rag_chat.json"
 )
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--dataset", default=DEFAULT_DATASET, help="Path to filtered FinanceBench JSON")
+    p.add_argument(
+        "dataset",
+        nargs="?",
+        default=DEFAULT_DATASET,
+        help="Path to filtered FinanceBench JSON",
+    )
     p.add_argument("--base-url", default="http://localhost:8000", help="Retrieval API base URL")
     p.add_argument(
         "--output",
-        default=DEFAULT_OUTPUT,
+        default=None,
         help="Where to write the detailed per-query results JSON",
     )
     p.add_argument(
@@ -63,53 +71,9 @@ def parse_args() -> argparse.Namespace:
 def build_chat_payload(
     item: dict[str, Any],
 ) -> dict[str, Any]:
-    return {"query": item["question"]}
-
-
-def collect_sse_response(response: Any) -> dict[str, Any]:
-    current_event: str | None = None
-    chunks: list[dict[str, Any]] = []
-    thinking_parts: list[str] = []
-    answer_parts: list[str] = []
-    stream_error: str | None = None
-
-    for raw_line in response:
-        line = raw_line.decode("utf-8").strip()
-        if line == "":
-            current_event = None
-            continue
-        if line.startswith(":"):
-            continue
-        if line.startswith("event:"):
-            current_event = line[len("event:"):].strip()
-            continue
-        if not line.startswith("data:"):
-            continue
-
-        data_str = line[len("data:"):].strip()
-        if not data_str:
-            continue
-        try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-
-        if current_event == "chunks":
-            chunks = data if isinstance(data, list) else []
-        elif current_event == "thinking" and isinstance(data, dict):
-            thinking_parts.append(str(data.get("delta", "")))
-        elif current_event == "answer" and isinstance(data, dict):
-            answer_parts.append(str(data.get("delta", "")))
-        elif current_event == "error" and isinstance(data, dict):
-            stream_error = str(data.get("message", "stream error"))
-        elif current_event == "done":
-            break
-
     return {
-        "chunks": chunks,
-        "thinking": "".join(thinking_parts),
-        "answer": "".join(answer_parts),
-        "stream_error": stream_error,
+        "query": item["question"],
+        "stream": False,
     }
 
 
@@ -128,27 +92,20 @@ def evaluate_query(
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "Accept": "text/event-stream",
+                "Accept": "application/json",
             },
             method="POST",
         )
         with request.urlopen(req, timeout=timeout) as response:
-            body = collect_sse_response(response)
+            body = json.loads(response.read().decode("utf-8"))
         latency_ms = round((time.perf_counter() - started) * 1000)
-        status = "ok" if not body["stream_error"] else "error"
         return {
-            "retrieved_chunks": body["chunks"],
-            "rag_chat": {
-                "status": status,
-                "error": body["stream_error"],
-                "response": {
-                    "reasoning": body["thinking"] or None,
-                    "answer": body["answer"] or None,
-                },
-                "timing": {
-                    "latency_ms": latency_ms,
-                },
-            },
+            "retrieved_chunks": body.get("chunks", []) or [],
+            "final_reasoning": body.get("thinking") or None,
+            "final_answer": body.get("answer") or None,
+            "latency_ms": latency_ms,
+            "status": "ok",
+            "error": None,
         }
     except (
         error.URLError,
@@ -160,40 +117,28 @@ def evaluate_query(
         latency_ms = round((time.perf_counter() - started) * 1000)
         return {
             "retrieved_chunks": [],
-            "rag_chat": {
-                "status": "error",
-                "error": str(exc),
-                "response": {
-                    "reasoning": None,
-                    "answer": None,
-                },
-                "timing": {
-                    "latency_ms": latency_ms,
-                },
-            },
+            "final_reasoning": None,
+            "final_answer": None,
+            "latency_ms": latency_ms,
+            "status": "error",
+            "error": str(exc),
         }
     except Exception as exc:
         latency_ms = round((time.perf_counter() - started) * 1000)
         return {
             "retrieved_chunks": [],
-            "rag_chat": {
-                "status": "error",
-                "error": f"unexpected error: {exc}",
-                "response": {
-                    "reasoning": None,
-                    "answer": None,
-                },
-                "timing": {
-                    "latency_ms": latency_ms,
-                },
-            },
+            "final_reasoning": None,
+            "final_answer": None,
+            "latency_ms": latency_ms,
+            "status": "error",
+            "error": f"unexpected error: {exc}",
         }
 
 
 def summarize(results: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(results)
-    ok_rows = [row for row in results if row["rag_chat"]["status"] == "ok"]
-    latencies = [row["rag_chat"]["timing"]["latency_ms"] for row in results]
+    ok_rows = [row for row in results if row["status"] == "ok"]
+    latencies = [row["latency_ms"] for row in results]
 
     return {
         "queries": total,
@@ -214,10 +159,18 @@ def write_payload(output_path: Path, payload: list[dict[str, Any]]) -> None:
     output_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def default_output_path(dataset_path: Path) -> Path:
+    if dataset_path.name.endswith(".json"):
+        output_name = dataset_path.name[:-5] + "_with_rag_chat.json"
+    else:
+        output_name = dataset_path.name + "_with_rag_chat.json"
+    return dataset_path.with_name(output_name)
+
+
 def main() -> None:
     args = parse_args()
     dataset_path = Path(args.dataset)
-    output_path = Path(args.output)
+    output_path = Path(args.output) if args.output else default_output_path(dataset_path)
     if args.write_every <= 0:
         raise SystemExit("--write-every must be >= 1")
 
@@ -238,20 +191,14 @@ def main() -> None:
             timeout=args.timeout,
         )
         results.append(result)
-        payload.append(
-            {
-                **item,
-                "retrieved_chunks": result["retrieved_chunks"],
-                "rag_chat": result["rag_chat"],
-            }
-        )
+        payload.append({**item, **result})
         if len(payload) % args.write_every == 0:
             write_payload(output_path, payload)
         print(
             f"[{index:03d}/{len(items):03d}] "
-            f"{result['rag_chat']['status'].upper()} "
+            f"{result['status'].upper()} "
             f"{item.get('financebench_id')} "
-            f"latency_ms={result['rag_chat']['timing']['latency_ms']} "
+            f"latency_ms={result['latency_ms']} "
             f"chunks={len(result['retrieved_chunks'])}"
         )
 
