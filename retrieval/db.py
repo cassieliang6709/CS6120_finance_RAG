@@ -1,8 +1,10 @@
+from typing import Optional
+
 import asyncpg
 from pgvector.asyncpg import register_vector
 from config import DB_HOST, DB_PORT, DB_NAME, DB_USER, DB_PASSWORD, DB_POOL_MIN, DB_POOL_MAX
 
-_pool: asyncpg.Pool | None = None
+_pool: Optional[asyncpg.Pool] = None
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:

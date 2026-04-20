@@ -25,6 +25,7 @@ dist/
 build/
 *.egg
 .venv/
+.venv-py39-backup/
 venv/
 env/
 

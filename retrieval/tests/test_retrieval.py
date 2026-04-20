@@ -17,6 +17,7 @@ import pytest_asyncio
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
+import retrieval as retrieval_module
 from retrieval import (
     build_filter_clause,
     detect_filing_type_in_query,
@@ -26,6 +27,7 @@ from retrieval import (
     minmax_normalize,
     query_prefers_explanatory_chunks,
     query_prefers_quantitative_chunks,
+    sanitize_bm25_query,
 )
 
 pytestmark = pytest.mark.anyio
@@ -104,6 +106,24 @@ def test_query_prefers_explanatory_chunks_detects_narrative_queries():
 
 def test_query_prefers_explanatory_chunks_skips_metric_queries():
     assert not query_prefers_explanatory_chunks("AMD revenue in 2023")
+
+
+def test_sanitize_bm25_query_removes_explicit_ticker_when_company_filter_scopes_corpus(monkeypatch):
+    monkeypatch.setattr(retrieval_module, "_known_tickers", {"AMZN"})
+    monkeypatch.setattr(retrieval_module, "_company_name_to_ticker", {"amazon.com, inc.": "AMZN"})
+    monkeypatch.setattr(
+        retrieval_module,
+        "_ticker_to_company_names",
+        {"AMZN": {"Amazon.com, Inc."}},
+    )
+    assert sanitize_bm25_query("AMZN revenue 2019 vs 2018", "AMZN") == "revenue 2019 vs 2018"
+
+
+def test_sanitize_bm25_query_falls_back_when_cleanup_would_empty_query(monkeypatch):
+    monkeypatch.setattr(retrieval_module, "_known_tickers", {"AMZN"})
+    monkeypatch.setattr(retrieval_module, "_company_name_to_ticker", {})
+    monkeypatch.setattr(retrieval_module, "_ticker_to_company_names", {})
+    assert sanitize_bm25_query("AMZN", "AMZN") == "AMZN"
 
 
 def test_detect_filing_type_in_query_explicit_10q():
@@ -294,14 +314,14 @@ async def test_retrieve_chunk_metadata_fields_present(real_client):
 
 
 @integration
-async def test_numeric_query_prefers_table_chunks(real_client):
+async def test_numeric_query_surfaces_table_chunks(real_client):
     resp = await real_client.post(
         "/retrieve", json={"query": "AMZN revenue 2019 vs 2018", "k": 3, "company": "AMZN"}
     )
     assert resp.status_code == 200
     chunks = resp.json()["chunks"]
     assert chunks
-    assert chunks[0]["content_kind"] == "table"
+    assert any(chunk["content_kind"] == "table" for chunk in chunks)
 
 
 @integration

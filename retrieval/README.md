@@ -100,9 +100,9 @@ curl -s -X POST http://localhost:8000/retrieve \
 
 ```bash
 # From the retrieval/ directory
-python3.11 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 
 # Unit tests only (no database required)
 pytest tests/ -m "not integration" -v

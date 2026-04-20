@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from typing import Optional
+from typing import Optional, Union
 
 import asyncpg
 from sentence_transformers import SentenceTransformer
@@ -11,9 +11,10 @@ from config import COMPANY_BOOST, EMBEDDING_MODEL, FILING_TYPE_BOOST, FISCAL_YEA
 from filing_type_patterns import FILING_TYPE_PATTERNS
 from models import ChunkResult
 
-_model: SentenceTransformer | None = None
+_model: Optional[SentenceTransformer] = None
 _known_tickers: set[str] = set()
 _company_name_to_ticker: dict[str, str] = {}
+_ticker_to_company_names: dict[str, set[str]] = {}
 
 _TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
 _YEAR_RE = re.compile(r"\b(20\d{2})\b")
@@ -42,7 +43,7 @@ def embed_query(query: str) -> list[float]:
 
 async def load_known_tickers(pool: asyncpg.Pool) -> None:
     """Populate ticker and company-name caches from the database."""
-    global _known_tickers, _company_name_to_ticker
+    global _known_tickers, _company_name_to_ticker, _ticker_to_company_names
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT DISTINCT ticker, company_name FROM v_chunk_search WHERE ticker IS NOT NULL"
@@ -53,6 +54,13 @@ async def load_known_tickers(pool: asyncpg.Pool) -> None:
         for r in rows
         if r["company_name"]
     }
+    _ticker_to_company_names = {}
+    for row in rows:
+        company_name = row["company_name"]
+        if not company_name:
+            continue
+        ticker = row["ticker"].upper()
+        _ticker_to_company_names.setdefault(ticker, set()).add(company_name)
 
 
 def detect_company_in_query(query: str) -> Optional[str]:
@@ -171,6 +179,28 @@ def fuse_scores(score_v: float, score_b: float, alpha: float) -> float:
     return alpha * score_v + (1.0 - alpha) * score_b
 
 
+def compute_rerank_bonus(
+    *,
+    needs_quant: bool,
+    needs_explanatory: bool,
+    content_kind: Optional[str],
+    source_type: str,
+) -> float:
+    bonus = 0.0
+    if needs_quant and content_kind == "table":
+        bonus += 0.20
+    if needs_explanatory and content_kind == "narrative":
+        bonus += 0.12
+    if needs_explanatory and source_type == "transcript" and content_kind in {
+        "qa",
+        "narrative",
+    }:
+        bonus += 0.08
+    if needs_quant and source_type == "news":
+        bonus -= 0.03
+    return bonus
+
+
 def build_filter_clause(
     sector: Optional[str],
     company: Optional[str],
@@ -179,7 +209,7 @@ def build_filter_clause(
 ) -> tuple[str, dict]:
     """Return a SQL WHERE fragment using :name placeholders, and a params dict."""
     conditions: list[str] = []
-    params: dict[str, str | int] = {}
+    params: dict[str, Union[str, int]] = {}
     if sector is not None:
         conditions.append("sector = :sector")
         params["sector"] = sector
@@ -193,6 +223,36 @@ def build_filter_clause(
         conditions.append("fiscal_year = :fiscal_year")
         params["fiscal_year"] = fiscal_year
     return " AND ".join(conditions), params
+
+
+def sanitize_bm25_query(query: str, company: Optional[str]) -> str:
+    """Drop explicit company mentions from BM25 when the SQL filter already scopes the corpus.
+
+    This prevents queries like "AMZN revenue 2019 vs 2018" with company="AMZN"
+    from producing an empty tsquery branch just because AMZN never appears in the
+    chunk text. If cleanup removes everything, fall back to the original query.
+    """
+    if not company:
+        return query
+
+    aliases: set[str] = {company.strip()}
+    company_key = company.strip().lower()
+    ticker = _company_name_to_ticker.get(company_key)
+    if ticker is None:
+        maybe_ticker = company.strip().upper()
+        if maybe_ticker in _known_tickers:
+            ticker = maybe_ticker
+
+    if ticker is not None:
+        aliases.add(ticker)
+        aliases.update(_ticker_to_company_names.get(ticker, set()))
+
+    cleaned = query
+    for alias in sorted((alias for alias in aliases if alias), key=len, reverse=True):
+        cleaned = re.sub(rf"\b{re.escape(alias)}\b", " ", cleaned, flags=re.IGNORECASE)
+
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or query
 
 
 def query_prefers_quantitative_chunks(query: str) -> bool:
@@ -384,8 +444,11 @@ async def retrieve(
     filing_type: Optional[str],
     fiscal_year: Optional[int] = None,
 ) -> list[ChunkResult]:
-    overfetch = k * 3
     query_vec = embed_query(query)
+    bm25_query = sanitize_bm25_query(query, company)
+    needs_quant = query_prefers_quantitative_chunks(query)
+    needs_explanatory = query_prefers_explanatory_chunks(query)
+    overfetch = max(k * 3, 30) if needs_quant else k * 3
     explicit_filing_type = None if filing_type else detect_filing_type_in_query(query)
     hinted_filing_type = None if filing_type else detect_filing_type_hint_in_query(query)
     effective_filing_type = filing_type or explicit_filing_type
@@ -412,7 +475,7 @@ async def retrieve(
         ),
         _bm25_search(
             pool,
-            query,
+            bm25_query,
             overfetch,
             filter_where,
             filter_params,
@@ -435,47 +498,38 @@ async def retrieve(
 
     norm_v = minmax_normalize(raw_v) if vec_rows else [0.0] * len(all_ids)
     norm_b = minmax_normalize(raw_b) if bm25_rows else [0.0] * len(all_ids)
-    needs_quant = query_prefers_quantitative_chunks(query)
-    needs_explanatory = query_prefers_explanatory_chunks(query)
     norm_d = minmax_normalize(raw_d) if needs_quant and raw_d else [0.0] * len(all_ids)
 
-    scored = sorted(
-        [
-            (
-                fuse_scores(norm_v[i], norm_b[i], alpha)
-                + (0.15 * norm_d[i] if needs_quant else 0.0),
-                cid,
+    scored = []
+    for i, cid in enumerate(all_ids):
+        row = vec_map.get(cid) or bm25_map.get(cid)
+        source_type = row.get("source_type") or "sec"
+        content_kind = row.get("content_kind")
+        final_score = (
+            fuse_scores(norm_v[i], norm_b[i], alpha)
+            + (0.15 * norm_d[i] if needs_quant else 0.0)
+            + compute_rerank_bonus(
+                needs_quant=needs_quant,
+                needs_explanatory=needs_explanatory,
+                content_kind=content_kind,
+                source_type=source_type,
             )
-            for i, cid in enumerate(all_ids)
-        ],
-        reverse=True,
-    )
+        )
+        scored.append((final_score, cid))
+    scored.sort(reverse=True)
 
     results: list[ChunkResult] = []
     for score, cid in scored[:k]:
         row = vec_map.get(cid) or bm25_map[cid]
-        rerank_bonus = 0.0
         content_kind = row.get("content_kind")
         source_type = row.get("source_type") or "sec"
-
-        if needs_quant and content_kind == "table":
-            rerank_bonus += 0.20
-        if needs_explanatory and content_kind == "narrative":
-            rerank_bonus += 0.12
-        if needs_explanatory and source_type == "transcript" and content_kind in {
-            "qa",
-            "narrative",
-        }:
-            rerank_bonus += 0.08
-        if needs_quant and source_type == "news":
-            rerank_bonus -= 0.03
 
         ft = row.get("filing_type") or ""
         results.append(
             ChunkResult(
                 chunk_id=cid,
                 text=row["text"],
-                score=round(score + rerank_bonus, 6),
+                score=round(score, 6),
                 company=row["company"],
                 sector=row["sector"],
                 filing_type=ft,
