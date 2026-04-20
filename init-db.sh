@@ -1,3 +1,8 @@
 #!/bin/bash
 set -e
-pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" /docker-entrypoint-initdb.d/financial_rag.dump || true
+pg_restore \
+  --username="$POSTGRES_USER" \
+  --dbname="$POSTGRES_DB" \
+  --no-owner \
+  --role="$POSTGRES_USER" \
+  /docker-entrypoint-initdb.d/financial_rag.dump

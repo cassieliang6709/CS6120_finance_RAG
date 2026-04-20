@@ -10,6 +10,8 @@ DB_PORT: int = int(os.getenv("DB_PORT", "5432"))
 DB_NAME: str = os.getenv("DB_NAME", "financial_rag")
 DB_USER: str = os.getenv("DB_USER", "postgres")
 DB_PASSWORD: str = os.getenv("DB_PASSWORD", "postgres")
+DB_CONNECT_RETRIES: int = int(os.getenv("DB_CONNECT_RETRIES", "30"))
+DB_CONNECT_RETRY_DELAY: float = float(os.getenv("DB_CONNECT_RETRY_DELAY", "2"))
 
 DEFAULT_K: int = int(os.getenv("DEFAULT_K", "5"))
 DEFAULT_ALPHA: float = float(os.getenv("DEFAULT_ALPHA", "0.7"))
