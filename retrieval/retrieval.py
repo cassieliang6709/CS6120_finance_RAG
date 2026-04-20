@@ -8,6 +8,7 @@ import asyncpg
 from sentence_transformers import SentenceTransformer
 
 from config import COMPANY_BOOST, EMBEDDING_MODEL, FILING_TYPE_BOOST, FISCAL_YEAR_BOOST
+from filing_type_patterns import FILING_TYPE_PATTERNS
 from models import ChunkResult
 
 _model: SentenceTransformer | None = None
@@ -15,15 +16,17 @@ _known_tickers: set[str] = set()
 _company_name_to_ticker: dict[str, str] = {}
 
 _TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
-_YEAR_RE = re.compile(r"(?:FY|fiscal\s+year\s*)?(20\d{2})", re.IGNORECASE)
+_YEAR_RE = re.compile(r"\b(20\d{2})\b")
+_YEAR_RANGE_RE = re.compile(r"\b(20\d{2})\s*(?:-|–|to)\s*(20\d{2})\b", re.IGNORECASE)
+_FISCAL_YEAR_RE = re.compile(r"\b(?:FY\s*20\d{2}|fiscal\s+year\s*20\d{2})\b", re.IGNORECASE)
+_ANNUAL_HINT_RE = re.compile(
+    r"\b(?:annual|yearly|full.?year|year.?end)\b",
+    re.IGNORECASE,
+)
 _QUARTER_RE = re.compile(
     r"\b(?:q[1-4]|quarter(?:ly)?|first quarter|second quarter|third quarter|fourth quarter)\b",
     re.IGNORECASE,
 )
-_FILING_TYPE_PATTERNS: dict[str, re.Pattern] = {
-    "10-K": re.compile(r"\b10-k\b|\bannual report\b|\bannual filing\b", re.IGNORECASE),
-    "10-Q": re.compile(r"\b10-q\b|\bquarterly report\b|\bquarterly filing\b", re.IGNORECASE),
-}
 
 
 def get_model() -> SentenceTransformer:
@@ -69,39 +72,69 @@ def detect_company_in_query(query: str) -> Optional[str]:
 
 
 def detect_filing_type_in_query(query: str) -> Optional[str]:
-    """Infer the filing type from the query text when the intent is clear.
+    """Return an explicit filing-type match when the query clearly names one type.
 
-    Rules:
-    - Explicit mentions like "10-K" or "quarterly report" win.
-    - Quarter-specific questions default to 10-Q.
-    - FY/annual-year questions default to 10-K unless they also mention a quarter.
+    Returns None for ambiguous queries that mention multiple filing types.
     """
-    for filing_type, pattern in _FILING_TYPE_PATTERNS.items():
-        if pattern.search(query):
-            return filing_type
-    if _QUARTER_RE.search(query):
+    matches = {
+        filing_type
+        for filing_type, pattern in FILING_TYPE_PATTERNS.items()
+        if pattern.search(query)
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def detect_filing_type_hint_in_query(query: str) -> Optional[str]:
+    """Infer a likely filing type from weaker annual/quarter signals for boosting only."""
+    explicit_match = detect_filing_type_in_query(query)
+    if explicit_match is not None:
+        return explicit_match
+
+    quarter_hint = bool(_QUARTER_RE.search(query))
+    annual_hint = bool(_FISCAL_YEAR_RE.search(query) or _ANNUAL_HINT_RE.search(query))
+
+    if quarter_hint and not annual_hint:
         return "10-Q"
-    if _YEAR_RE.search(query):
+    if annual_hint and not quarter_hint:
         return "10-K"
     return None
 
 
+def detect_years_in_query(query: str) -> list[str]:
+    """Return distinct 20xx years mentioned directly or via small ranges."""
+    years: set[int] = set()
+
+    for start_text, end_text in _YEAR_RANGE_RE.findall(query):
+        start = int(start_text)
+        end = int(end_text)
+        if start > end:
+            start, end = end, start
+        # Keep expansion bounded to avoid boosting implausibly large spans.
+        if end - start <= 10:
+            years.update(range(start, end + 1))
+
+    for match in _YEAR_RE.findall(query):
+        years.add(int(match))
+
+    return [str(year) for year in sorted(years)]
+
+
 def detect_year_in_query(query: str) -> Optional[str]:
-    """Return the first 20xx year string found in the query, or None."""
-    match = _YEAR_RE.search(query)
-    return match.group(1) if match else None
+    """Return the first detected year for backwards compatibility."""
+    years = detect_years_in_query(query)
+    return years[0] if years else None
 
 
 def build_boost_expression(
     boost_ticker: Optional[str],
     boost_filing_type: Optional[str],
-    boost_year: Optional[str],
+    boost_years: list[str],
     start_idx: int,
 ) -> tuple[str, list, int]:
     """Return a SQL multiplicative boost expression, its positional param values, and next index.
 
     Boost values are inlined as float literals (server-controlled config); only the
-    comparison values (ticker, filing_type, year) are parameterised for safety.
+    comparison values (ticker, filing_type, years) are parameterised for safety.
     """
     parts: list[str] = []
     values: list = []
@@ -114,9 +147,11 @@ def build_boost_expression(
         parts.append(f"CASE WHEN filing_type = ${idx} THEN {FILING_TYPE_BOOST}::float ELSE 1.0 END")
         values.append(boost_filing_type)
         idx += 1
-    if boost_year:
-        parts.append(f"CASE WHEN fiscal_year::text = ${idx} THEN {FISCAL_YEAR_BOOST}::float ELSE 1.0 END")
-        values.append(boost_year)
+    if boost_years:
+        parts.append(
+            f"CASE WHEN fiscal_year::text = ANY(${idx}::text[]) THEN {FISCAL_YEAR_BOOST}::float ELSE 1.0 END"
+        )
+        values.append(boost_years)
         idx += 1
     expr = " * ".join(parts) if parts else "1.0"
     return expr, values, idx
@@ -182,10 +217,10 @@ async def _vector_search(
     filter_params: dict,
     boost_ticker: Optional[str] = None,
     boost_filing_type: Optional[str] = None,
-    boost_year: Optional[str] = None,
+    boost_years: Optional[list[str]] = None,
 ) -> list[dict]:
     boost_expr, boost_vals, _ = build_boost_expression(
-        boost_ticker, boost_filing_type, boost_year, start_idx=3 + len(filter_params)
+        boost_ticker, boost_filing_type, boost_years or [], start_idx=3 + len(filter_params)
     )
     sql = f"""
         SELECT
@@ -219,10 +254,10 @@ async def _bm25_search(
     filter_params: dict,
     boost_ticker: Optional[str] = None,
     boost_filing_type: Optional[str] = None,
-    boost_year: Optional[str] = None,
+    boost_years: Optional[list[str]] = None,
 ) -> list[dict]:
     boost_expr, boost_vals, _ = build_boost_expression(
-        boost_ticker, boost_filing_type, boost_year, start_idx=3 + len(filter_params)
+        boost_ticker, boost_filing_type, boost_years or [], start_idx=3 + len(filter_params)
     )
     sql = f"""
         SELECT
@@ -259,21 +294,22 @@ async def retrieve(
 ) -> list[ChunkResult]:
     overfetch = k * 3
     query_vec = embed_query(query)
-    inferred_filing_type = None if filing_type else detect_filing_type_in_query(query)
-    effective_filing_type = filing_type or inferred_filing_type
+    explicit_filing_type = None if filing_type else detect_filing_type_in_query(query)
+    hinted_filing_type = None if filing_type else detect_filing_type_hint_in_query(query)
+    effective_filing_type = filing_type or explicit_filing_type
     filter_where, filter_params = build_filter_clause(sector, company, effective_filing_type)
 
     # Detect signals before retrieval so boosts are embedded in SQL ORDER BY,
     # affecting which chunks the DB returns rather than just reordering them after.
     boost_ticker = None if company else detect_company_in_query(query)
-    boost_filing_type = None if effective_filing_type else inferred_filing_type
-    boost_year = detect_year_in_query(query)
+    boost_filing_type = None if effective_filing_type else hinted_filing_type
+    boost_years = detect_years_in_query(query)
 
     vec_rows, bm25_rows = await asyncio.gather(
         _vector_search(pool, query_vec, overfetch, filter_where, filter_params,
-                       boost_ticker, boost_filing_type, boost_year),
+                       boost_ticker, boost_filing_type, boost_years),
         _bm25_search(pool, query, overfetch, filter_where, filter_params,
-                     boost_ticker, boost_filing_type, boost_year),
+                     boost_ticker, boost_filing_type, boost_years),
     )
 
     vec_map: dict[str, dict] = {r["chunk_id"]: r for r in vec_rows}
