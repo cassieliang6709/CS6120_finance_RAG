@@ -14,7 +14,25 @@ from models import ChunkResult
 _model: Optional[SentenceTransformer] = None
 _known_tickers: set[str] = set()
 _company_name_to_ticker: dict[str, str] = {}
+_company_alias_to_ticker: dict[str, str] = {}
 _ticker_to_company_names: dict[str, set[str]] = {}
+_ticker_to_company_aliases: dict[str, set[str]] = {}
+
+_LEADING_COMPANY_TOKENS = {"the"}
+_TRAILING_COMPANY_TOKENS = {
+    "co",
+    "company",
+    "corp",
+    "corporation",
+    "group",
+    "holdings",
+    "inc",
+    "incorporated",
+    "limited",
+    "ltd",
+    "plc",
+}
+_DOMAIN_COMPANY_TOKENS = {"com", "net", "org"}
 
 _TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
 _YEAR_RE = re.compile(r"\b(20\d{2})\b")
@@ -41,9 +59,50 @@ def embed_query(query: str) -> list[float]:
     return get_model().encode(query, normalize_embeddings=True).tolist()
 
 
+def _normalize_company_text(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def _generate_company_aliases(company_name: str) -> set[str]:
+    normalized = _normalize_company_text(company_name)
+    if not normalized:
+        return set()
+
+    aliases: set[str] = set()
+
+    def add_alias(tokens: list[str]) -> None:
+        if not tokens:
+            return
+        alias = " ".join(tokens).strip()
+        compact_alias = alias.replace(" ", "")
+        if len(compact_alias) < 3:
+            return
+        aliases.add(alias)
+        aliases.add(compact_alias)
+
+    base_tokens = normalized.split()
+    add_alias(base_tokens)
+
+    tokens = base_tokens[:]
+    while tokens and tokens[0] in _LEADING_COMPANY_TOKENS:
+        tokens = tokens[1:]
+        add_alias(tokens)
+
+    trimmed_tokens = tokens[:] if tokens else base_tokens[:]
+    while trimmed_tokens and trimmed_tokens[-1] in _TRAILING_COMPANY_TOKENS:
+        trimmed_tokens = trimmed_tokens[:-1]
+        add_alias(trimmed_tokens)
+
+    if len(trimmed_tokens) >= 2 and trimmed_tokens[1] in _DOMAIN_COMPANY_TOKENS:
+        add_alias([trimmed_tokens[0]])
+
+    return aliases
+
+
 async def load_known_tickers(pool: asyncpg.Pool) -> None:
     """Populate ticker and company-name caches from the database."""
-    global _known_tickers, _company_name_to_ticker, _ticker_to_company_names
+    global _known_tickers, _company_name_to_ticker, _company_alias_to_ticker
+    global _ticker_to_company_names, _ticker_to_company_aliases
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             "SELECT DISTINCT ticker, company_name FROM v_chunk_search WHERE ticker IS NOT NULL"
@@ -55,12 +114,45 @@ async def load_known_tickers(pool: asyncpg.Pool) -> None:
         if r["company_name"]
     }
     _ticker_to_company_names = {}
+    _ticker_to_company_aliases = {}
+    alias_candidates: dict[str, set[str]] = {}
     for row in rows:
         company_name = row["company_name"]
         if not company_name:
             continue
         ticker = row["ticker"].upper()
         _ticker_to_company_names.setdefault(ticker, set()).add(company_name)
+        aliases = _generate_company_aliases(company_name)
+        if aliases:
+            _ticker_to_company_aliases.setdefault(ticker, set()).update(aliases)
+            for alias in aliases:
+                alias_candidates.setdefault(alias, set()).add(ticker)
+
+    _company_alias_to_ticker = {
+        alias: next(iter(tickers))
+        for alias, tickers in alias_candidates.items()
+        if len(tickers) == 1
+    }
+
+
+def resolve_company_filter(company: Optional[str]) -> Optional[str]:
+    """Resolve a company filter to its canonical ticker when possible."""
+    if company is None:
+        return None
+
+    candidate = company.strip()
+    if not candidate:
+        return company
+
+    maybe_ticker = candidate.upper()
+    if maybe_ticker in _known_tickers:
+        return maybe_ticker
+
+    if candidate.lower() in _company_name_to_ticker:
+        return _company_name_to_ticker[candidate.lower()]
+
+    normalized = _normalize_company_text(candidate)
+    return _company_alias_to_ticker.get(normalized, company)
 
 
 def detect_company_in_query(query: str) -> Optional[str]:
@@ -72,9 +164,11 @@ def detect_company_in_query(query: str) -> Optional[str]:
     for match in _TICKER_RE.finditer(query):
         if match.group(1) in _known_tickers:
             return match.group(1)
-    query_lower = query.lower()
-    for name, ticker in _company_name_to_ticker.items():
-        if re.search(r'\b' + re.escape(name) + r'\b', query_lower):
+
+    normalized_query = _normalize_company_text(query)
+    aliases = sorted(_company_alias_to_ticker.items(), key=lambda item: len(item[0]), reverse=True)
+    for alias, ticker in aliases:
+        if re.search(r"\b" + re.escape(alias) + r"\b", normalized_query):
             return ticker
     return None
 
@@ -246,6 +340,7 @@ def sanitize_bm25_query(query: str, company: Optional[str]) -> str:
     if ticker is not None:
         aliases.add(ticker)
         aliases.update(_ticker_to_company_names.get(ticker, set()))
+        aliases.update(_ticker_to_company_aliases.get(ticker, set()))
 
     cleaned = query
     for alias in sorted((alias for alias in aliases if alias), key=len, reverse=True):
@@ -444,8 +539,10 @@ async def retrieve(
     filing_type: Optional[str],
     fiscal_year: Optional[int] = None,
 ) -> list[ChunkResult]:
+    resolved_company = resolve_company_filter(company)
+    detected_company = None if resolved_company else detect_company_in_query(query)
     query_vec = embed_query(query)
-    bm25_query = sanitize_bm25_query(query, company)
+    bm25_query = sanitize_bm25_query(query, resolved_company or detected_company)
     needs_quant = query_prefers_quantitative_chunks(query)
     needs_explanatory = query_prefers_explanatory_chunks(query)
     overfetch = max(k * 3, 30) if needs_quant else k * 3
@@ -453,12 +550,12 @@ async def retrieve(
     hinted_filing_type = None if filing_type else detect_filing_type_hint_in_query(query)
     effective_filing_type = filing_type or explicit_filing_type
     filter_where, filter_params = build_filter_clause(
-        sector, company, effective_filing_type, fiscal_year
+        sector, resolved_company, effective_filing_type, fiscal_year
     )
 
     # Detect signals before retrieval so boosts are embedded in SQL ORDER BY,
     # affecting which chunks the DB returns rather than just reordering them after.
-    boost_ticker = None if company else detect_company_in_query(query)
+    boost_ticker = detected_company
     boost_filing_type = None if effective_filing_type else hinted_filing_type
     boost_years = detect_years_in_query(query)
 

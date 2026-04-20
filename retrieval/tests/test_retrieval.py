@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 import retrieval as retrieval_module
 from retrieval import (
     build_filter_clause,
+    detect_company_in_query,
     detect_filing_type_in_query,
     detect_filing_type_hint_in_query,
     detect_years_in_query,
@@ -27,6 +28,7 @@ from retrieval import (
     minmax_normalize,
     query_prefers_explanatory_chunks,
     query_prefers_quantitative_chunks,
+    resolve_company_filter,
     sanitize_bm25_query,
 )
 
@@ -122,8 +124,48 @@ def test_sanitize_bm25_query_removes_explicit_ticker_when_company_filter_scopes_
 def test_sanitize_bm25_query_falls_back_when_cleanup_would_empty_query(monkeypatch):
     monkeypatch.setattr(retrieval_module, "_known_tickers", {"AMZN"})
     monkeypatch.setattr(retrieval_module, "_company_name_to_ticker", {})
+    monkeypatch.setattr(retrieval_module, "_ticker_to_company_aliases", {})
     monkeypatch.setattr(retrieval_module, "_ticker_to_company_names", {})
     assert sanitize_bm25_query("AMZN", "AMZN") == "AMZN"
+
+
+def test_sanitize_bm25_query_removes_company_aliases_when_company_is_resolved(monkeypatch):
+    monkeypatch.setattr(retrieval_module, "_known_tickers", {"AMZN"})
+    monkeypatch.setattr(retrieval_module, "_company_name_to_ticker", {"amazon.com, inc.": "AMZN"})
+    monkeypatch.setattr(
+        retrieval_module,
+        "_ticker_to_company_aliases",
+        {"AMZN": {"amazon", "amazoncom"}},
+    )
+    monkeypatch.setattr(
+        retrieval_module,
+        "_ticker_to_company_names",
+        {"AMZN": {"Amazon.com, Inc."}},
+    )
+    assert sanitize_bm25_query("Amazon risk factors", "AMZN") == "risk factors"
+
+
+def test_detect_company_in_query_supports_short_company_alias(monkeypatch):
+    monkeypatch.setattr(retrieval_module, "_known_tickers", {"AMZN"})
+    monkeypatch.setattr(retrieval_module, "_company_alias_to_ticker", {"amazon": "AMZN"})
+    assert detect_company_in_query("What is Amazon trend in operating income?") == "AMZN"
+
+
+def test_detect_company_in_query_supports_compact_alias(monkeypatch):
+    monkeypatch.setattr(retrieval_module, "_known_tickers", {"XOM"})
+    monkeypatch.setattr(retrieval_module, "_company_alias_to_ticker", {"exxonmobil": "XOM"})
+    assert detect_company_in_query("How did ExxonMobil describe its upstream plan?") == "XOM"
+
+
+def test_resolve_company_filter_maps_alias_to_ticker(monkeypatch):
+    monkeypatch.setattr(retrieval_module, "_known_tickers", {"AMZN"})
+    monkeypatch.setattr(retrieval_module, "_company_name_to_ticker", {"amazon.com, inc.": "AMZN"})
+    monkeypatch.setattr(
+        retrieval_module,
+        "_company_alias_to_ticker",
+        {"amazon": "AMZN", "amazoncom": "AMZN"},
+    )
+    assert resolve_company_filter("Amazon") == "AMZN"
 
 
 def test_detect_filing_type_in_query_explicit_10q():
