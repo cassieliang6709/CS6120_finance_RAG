@@ -12,7 +12,7 @@ services:
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U postgres -d financial_rag"]
       interval: 5s
       timeout: 5s
       retries: 10
@@ -32,6 +32,7 @@ services:
 
   retrieval:
     build: ./retrieval
+    restart: on-failure
     depends_on:
       db:
         condition: service_healthy
@@ -41,6 +42,8 @@ services:
       DB_NAME: financial_rag
       DB_USER: postgres
       DB_PASSWORD: postgres
+      DB_CONNECT_RETRIES: 20
+      DB_CONNECT_RETRY_DELAY: 2.0
       # LLM (HPC SGLang endpoint, backend-only — read from repo-root .env)
       SGLANG_BASE_URL: ${SGLANG_BASE_URL:-}
       SGLANG_MODEL: ${SGLANG_MODEL:-Qwen/Qwen3.5-397B-A17B-FP8}

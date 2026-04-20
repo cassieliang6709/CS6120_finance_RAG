@@ -18,6 +18,8 @@ DEFAULT_ALPHA: float = float(os.getenv("DEFAULT_ALPHA", "0.7"))
 
 DB_POOL_MIN: int = 1
 DB_POOL_MAX: int = 10
+DB_CONNECT_RETRIES: int = int(os.getenv("DB_CONNECT_RETRIES", "10"))
+DB_CONNECT_RETRY_DELAY: float = float(os.getenv("DB_CONNECT_RETRY_DELAY", "2.0"))
 
 # LLM (OpenAI-compatible SGLang endpoint, backend-only — never exposed to frontend)
 SGLANG_BASE_URL: str = os.getenv("SGLANG_BASE_URL", "")

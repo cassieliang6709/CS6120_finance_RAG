@@ -4,5 +4,5 @@ pg_restore \
   --username="$POSTGRES_USER" \
   --dbname="$POSTGRES_DB" \
   --no-owner \
-  --role="$POSTGRES_USER" \
+  --no-privileges \
   /docker-entrypoint-initdb.d/financial_rag.dump
