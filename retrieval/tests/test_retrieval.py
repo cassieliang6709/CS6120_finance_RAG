@@ -24,6 +24,8 @@ from retrieval import (
     detect_years_in_query,
     fuse_scores,
     minmax_normalize,
+    query_prefers_explanatory_chunks,
+    query_prefers_quantitative_chunks,
 )
 
 pytestmark = pytest.mark.anyio
@@ -61,23 +63,47 @@ def test_fuse_scores_default_alpha():
 
 
 def test_build_filter_clause_no_filters():
-    where, params = build_filter_clause(None, None, None)
+    where, params = build_filter_clause(None, None, None, None)
     assert where == ""
     assert params == {}
 
 
 def test_build_filter_clause_single_filter():
-    where, params = build_filter_clause("financials", None, None)
+    where, params = build_filter_clause("financials", None, None, None)
     assert "sector = :sector" in where
     assert params == {"sector": "financials"}
 
 
 def test_build_filter_clause_all_filters():
-    where, params = build_filter_clause("banking", "JPM", "10-K")
+    where, params = build_filter_clause("banking", "JPMorgan Chase & Co.", "10-K", 2023)
     assert "sector = :sector" in where
-    assert "ticker = :company" in where
+    assert "company_name" in where
     assert "filing_type = :filing_type" in where
-    assert params == {"sector": "banking", "company": "JPM", "filing_type": "10-K"}
+    assert "fiscal_year = :fiscal_year" in where
+    assert params == {
+        "sector": "banking",
+        "company": "JPMorgan Chase & Co.",
+        "filing_type": "10-K",
+        "fiscal_year": 2023,
+    }
+
+
+def test_query_prefers_quantitative_chunks_detects_metric_queries():
+    assert query_prefers_quantitative_chunks("AMD revenue in 2023")
+    assert query_prefers_quantitative_chunks("What was gross margin?")
+
+
+def test_query_prefers_quantitative_chunks_skips_narrative_queries():
+    assert not query_prefers_quantitative_chunks("Summarize the risk factors discussion")
+
+
+def test_query_prefers_explanatory_chunks_detects_narrative_queries():
+    assert query_prefers_explanatory_chunks("Why did management lower outlook?")
+    assert query_prefers_explanatory_chunks("Summarize the risk factors discussion")
+
+
+def test_query_prefers_explanatory_chunks_skips_metric_queries():
+    assert not query_prefers_explanatory_chunks("AMD revenue in 2023")
 
 
 def test_detect_filing_type_in_query_explicit_10q():
@@ -247,10 +273,46 @@ async def test_retrieve_chunk_metadata_fields_present(real_client):
         "/retrieve", json={"query": "cash flow from operations", "k": 3}
     )
     assert resp.status_code == 200
-    required = {"chunk_id", "text", "score", "company", "sector", "filing_type",
-                "filed_date", "source_url", "article_title", "page_num"}
+    required = {
+        "chunk_id",
+        "text",
+        "score",
+        "company",
+        "sector",
+        "filing_type",
+        "filed_date",
+        "source_url",
+        "article_title",
+        "page_num",
+        "source_type",
+        "content_kind",
+        "chunk_strategy",
+        "display_title",
+    }
     for chunk in resp.json()["chunks"]:
         assert required.issubset(chunk.keys()), f"Missing fields in chunk: {chunk.keys()}"
+
+
+@integration
+async def test_numeric_query_prefers_table_chunks(real_client):
+    resp = await real_client.post(
+        "/retrieve", json={"query": "AMZN revenue 2019 vs 2018", "k": 3, "company": "AMZN"}
+    )
+    assert resp.status_code == 200
+    chunks = resp.json()["chunks"]
+    assert chunks
+    assert chunks[0]["content_kind"] == "table"
+
+
+@integration
+async def test_explanatory_query_prefers_narrative_chunks(real_client):
+    resp = await real_client.post(
+        "/retrieve", json={"query": "Summarize the risk factors discussion", "k": 3}
+    )
+    assert resp.status_code == 200
+    chunks = resp.json()["chunks"]
+    assert chunks
+    assert chunks[0]["content_kind"] == "narrative"
 
 
 @integration

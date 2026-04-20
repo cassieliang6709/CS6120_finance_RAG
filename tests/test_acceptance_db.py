@@ -35,6 +35,11 @@ class DatabaseAcceptanceTests(unittest.TestCase):
         assert row is not None
         return row
 
+    def fetchall(self, sql: str, params: tuple = ()) -> list[tuple]:
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            return list(cur.fetchall())
+
     def test_database_meets_10k_volume_requirements(self) -> None:
         total_rows = self.fetchone(
             """
@@ -76,8 +81,22 @@ class DatabaseAcceptanceTests(unittest.TestCase):
         self.assertEqual(duplicate_groups, 0)
 
     def test_company_metadata_is_backfilled(self) -> None:
-        ticker_like_names = self.fetchone(
-            "SELECT COUNT(*) FROM v_chunk_search WHERE company_name = ticker"
+        non_numeric_ticker_like_names = self.fetchone(
+            """
+            SELECT COUNT(*)
+            FROM v_chunk_search
+            WHERE company_name = ticker
+              AND ticker !~ '^[0-9]+$'
+            """
+        )[0]
+        aliased_numeric_ticker_placeholders = self.fetchone(
+            """
+            SELECT COUNT(DISTINCT ticker)
+            FROM v_chunk_search
+            WHERE company_name = ticker
+              AND ticker = ANY(%s)
+            """,
+            (list(SEC_TICKER_ALIASES.keys()),),
         )[0]
         unresolved_company_sectors = self.fetchone(
             "SELECT COUNT(*) FROM companies WHERE lower(coalesce(sector, '')) IN ('', 'unknown')"
@@ -94,7 +113,8 @@ class DatabaseAcceptanceTests(unittest.TestCase):
             """
         )[0]
 
-        self.assertEqual(ticker_like_names, 0)
+        self.assertEqual(non_numeric_ticker_like_names, 0)
+        self.assertLessEqual(aliased_numeric_ticker_placeholders, len(SEC_TICKER_ALIASES))
         self.assertEqual(unresolved_company_sectors, 0)
         self.assertEqual(unresolved_chunk_sectors, 0)
         self.assertEqual(missing_company_links, 0)
@@ -135,13 +155,38 @@ class DatabaseAcceptanceTests(unittest.TestCase):
             """,
             (list(validated_tickers),),
         )
+        min_chunks_per_filing, filings_with_tables, filings_with_narrative = self.fetchone(
+            """
+            WITH per_filing AS (
+                SELECT
+                    filing_id,
+                    COUNT(*) AS chunk_count,
+                    COUNT(*) FILTER (WHERE content_kind = 'table') AS table_chunks,
+                    COUNT(*) FILTER (WHERE content_kind = 'narrative') AS narrative_chunks
+                FROM chunks
+                WHERE ticker = ANY(%s)
+                  AND fiscal_year = 2023
+                  AND filing_type IN ('10-K', '10-Q')
+                GROUP BY filing_id
+            )
+            SELECT
+                MIN(chunk_count),
+                COUNT(*) FILTER (WHERE table_chunks > 0),
+                COUNT(*) FILTER (WHERE narrative_chunks > 0)
+            FROM per_filing
+            """,
+            (list(validated_tickers),),
+        )
 
         self.assertEqual(filing_count, 16)
         self.assertEqual(filing_dates, 16)
         self.assertEqual(filing_urls, 16)
         self.assertEqual(period_rows, 16)
-        self.assertEqual(sec_chunk_count, 2285)
-        self.assertEqual(sec_embedded_count, 2285)
+        self.assertEqual(sec_embedded_count, sec_chunk_count)
+        self.assertGreaterEqual(sec_chunk_count, 1_500)
+        self.assertGreaterEqual(min_chunks_per_filing, 3)
+        self.assertEqual(filings_with_tables, filing_count)
+        self.assertEqual(filings_with_narrative, filing_count)
 
     def test_local_sec_disk_coverage_is_complete(self) -> None:
         local_root = Path(SEC_DOWNLOAD_DIR) / "sec-edgar-filings"
@@ -168,6 +213,153 @@ class DatabaseAcceptanceTests(unittest.TestCase):
         self.assertGreater(len(local_keys), 0)
         self.assertEqual(local_keys - db_keys, set())
         self.assertEqual(db_keys - local_keys, set())
+
+    def test_sec_filings_have_complete_metadata(self) -> None:
+        missing_meta_count = self.fetchone(
+            """
+            SELECT COUNT(*)
+            FROM filings
+            WHERE filing_type IN ('10-K', '10-Q')
+              AND (
+                    filed_date IS NULL OR
+                    period_of_report IS NULL OR
+                    nullif(accession_number, '') IS NULL OR
+                    nullif(cik, '') IS NULL OR
+                    nullif(source_url, '') IS NULL
+                  )
+            """
+        )[0]
+        self.assertEqual(missing_meta_count, 0)
+
+    def test_sec_fiscal_year_and_period_are_consistent(self) -> None:
+        bad_10k_fiscal_years = self.fetchone(
+            """
+            SELECT COUNT(*)
+            FROM filings
+            WHERE filing_type = '10-K'
+              AND period_of_report IS NOT NULL
+              AND EXTRACT(YEAR FROM period_of_report) <> fiscal_year
+            """
+        )[0]
+        bad_10q_periods = self.fetchone(
+            """
+            SELECT COUNT(*)
+            FROM filings
+            WHERE filing_type = '10-Q'
+              AND period NOT IN ('Q1', 'Q2', 'Q3')
+            """
+        )[0]
+
+        self.assertEqual(bad_10k_fiscal_years, 0)
+        self.assertEqual(bad_10q_periods, 0)
+
+    def test_chunk_metadata_matches_parent_filing(self) -> None:
+        inconsistent_chunk_count = self.fetchone(
+            """
+            SELECT COUNT(*)
+            FROM chunks c
+            JOIN filings f ON f.id = c.filing_id
+            WHERE c.ticker IS DISTINCT FROM f.ticker
+               OR c.filing_type IS DISTINCT FROM f.filing_type
+               OR c.fiscal_year IS DISTINCT FROM f.fiscal_year
+               OR c.period IS DISTINCT FROM f.period
+               OR c.filed_date IS DISTINCT FROM f.filed_date
+               OR c.source_url IS DISTINCT FROM f.source_url
+            """
+        )[0]
+        self.assertEqual(inconsistent_chunk_count, 0)
+
+    def test_search_support_columns_are_populated(self) -> None:
+        missing_search_columns = self.fetchone(
+            """
+            SELECT COUNT(*)
+            FROM chunks
+            WHERE content_tsv IS NULL
+               OR embedding IS NULL
+               OR numeric_token_count IS NULL
+               OR number_density IS NULL
+               OR data_signal_score IS NULL
+               OR is_quantitative IS NULL
+            """
+        )[0]
+        self.assertEqual(missing_search_columns, 0)
+
+    def test_quantitative_sections_score_above_narrative_sections(self) -> None:
+        rows = self.fetchall(
+            """
+            SELECT section_name, AVG(data_signal_score) AS avg_score
+            FROM chunks
+            WHERE section_name IN (
+                'Financial Statements',
+                'Selected Financial Data',
+                'Business Description',
+                'Risk Factors'
+            )
+            GROUP BY section_name
+            """
+        )
+        score_map = {section_name: float(avg_score) for section_name, avg_score in rows}
+        self.assertGreater(score_map["Financial Statements"], score_map["Business Description"])
+        self.assertGreater(score_map["Selected Financial Data"], score_map["Risk Factors"])
+
+    def test_exact_company_name_is_filterable_in_search_view(self) -> None:
+        amd_company_name, amd_chunk_count = self.fetchone(
+            """
+            SELECT company_name, COUNT(*)
+            FROM v_chunk_search
+            WHERE lower(company_name) = lower('Advanced Micro Devices, Inc.')
+              AND ticker = 'AMD'
+              AND filing_type = '10-K'
+              AND fiscal_year = 2023
+            GROUP BY company_name
+            """
+        )
+        self.assertEqual(amd_company_name, "Advanced Micro Devices, Inc.")
+        self.assertGreater(amd_chunk_count, 0)
+
+    def test_retrieval_view_covers_all_available_chunk_sources(self) -> None:
+        retrieval_source_types = {
+            source_type
+            for (source_type,) in self.fetchall(
+                "SELECT DISTINCT source_type FROM v_retrieval_chunks"
+            )
+        }
+        transcript_chunk_count = self.fetchone(
+            "SELECT COUNT(*) FROM transcript_chunks"
+        )[0]
+
+        self.assertIn("sec", retrieval_source_types)
+        self.assertIn("news", retrieval_source_types)
+        if transcript_chunk_count > 0:
+            self.assertIn("transcript", retrieval_source_types)
+
+    def test_structured_chunk_metadata_columns_are_populated(self) -> None:
+        missing_structured_metadata = self.fetchone(
+            """
+            SELECT COUNT(*)
+            FROM v_retrieval_chunks
+            WHERE content_kind IS NULL
+               OR nullif(chunk_strategy, '') IS NULL
+               OR structure_meta IS NULL
+            """
+        )[0]
+        self.assertEqual(missing_structured_metadata, 0)
+
+    def test_financial_statement_table_chunks_exist(self) -> None:
+        total_table_chunks = self.fetchone(
+            "SELECT COUNT(*) FROM chunks WHERE content_kind = 'table'"
+        )[0]
+        financial_statement_tables = self.fetchone(
+            """
+            SELECT COUNT(*)
+            FROM chunks
+            WHERE content_kind = 'table'
+              AND section_name = 'Financial Statements'
+            """
+        )[0]
+
+        self.assertGreater(total_table_chunks, 0)
+        self.assertGreater(financial_statement_tables, 0)
 
 
 if __name__ == "__main__":

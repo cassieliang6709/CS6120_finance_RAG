@@ -36,11 +36,23 @@ CREATE TABLE IF NOT EXISTS filings (
     fiscal_year     SMALLINT,
     period          TEXT,                   -- e.g. 'Q1', 'Q2', 'annual'
     filed_date      DATE,
+    period_of_report DATE,
+    accession_number TEXT,
+    cik             TEXT,
     source_url      TEXT,
     local_path      TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (ticker, filing_type, fiscal_year, period)
 );
+
+ALTER TABLE filings
+    ADD COLUMN IF NOT EXISTS period_of_report DATE;
+
+ALTER TABLE filings
+    ADD COLUMN IF NOT EXISTS accession_number TEXT;
+
+ALTER TABLE filings
+    ADD COLUMN IF NOT EXISTS cik TEXT;
 
 CREATE INDEX IF NOT EXISTS idx_filings_ticker
     ON filings (ticker);
@@ -48,6 +60,10 @@ CREATE INDEX IF NOT EXISTS idx_filings_type_year
     ON filings (filing_type, fiscal_year);
 CREATE INDEX IF NOT EXISTS idx_filings_filed_date
     ON filings (filed_date);
+CREATE INDEX IF NOT EXISTS idx_filings_period_of_report
+    ON filings (period_of_report);
+CREATE INDEX IF NOT EXISTS idx_filings_accession
+    ON filings (accession_number);
 
 -- =============================================================================
 -- 3. chunks  (SEC filing text chunks with vector + FTS)
@@ -66,6 +82,15 @@ CREATE TABLE IF NOT EXISTS chunks (
     content         TEXT        NOT NULL,
     char_count      INTEGER     NOT NULL,
     token_count     INTEGER     NOT NULL,
+    numeric_token_count INTEGER NOT NULL DEFAULT 0,
+    number_density  REAL        NOT NULL DEFAULT 0,
+    data_signal_score REAL      NOT NULL DEFAULT 0,
+    is_quantitative BOOLEAN     NOT NULL DEFAULT FALSE,
+    content_kind    TEXT        NOT NULL DEFAULT 'narrative',
+    chunk_strategy  TEXT        NOT NULL DEFAULT 'sentence_pack',
+    display_title   TEXT,
+    chunk_group_key TEXT,
+    structure_meta  JSONB       NOT NULL DEFAULT '{}'::jsonb,
     embedding       vector(384),
     content_tsv     TSVECTOR,
     source_url      TEXT,
@@ -77,6 +102,33 @@ ALTER TABLE chunks
 
 ALTER TABLE chunks
     ADD COLUMN IF NOT EXISTS chunk_index INTEGER;
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS numeric_token_count INTEGER NOT NULL DEFAULT 0;
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS number_density REAL NOT NULL DEFAULT 0;
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS data_signal_score REAL NOT NULL DEFAULT 0;
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS is_quantitative BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS content_kind TEXT NOT NULL DEFAULT 'narrative';
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS chunk_strategy TEXT NOT NULL DEFAULT 'sentence_pack';
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS display_title TEXT;
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS chunk_group_key TEXT;
+
+ALTER TABLE chunks
+    ADD COLUMN IF NOT EXISTS structure_meta JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 UPDATE chunks c
 SET filed_date = f.filed_date
@@ -181,6 +233,8 @@ CREATE INDEX IF NOT EXISTS idx_chunks_fiscal_year
     ON chunks (fiscal_year);
 CREATE INDEX IF NOT EXISTS idx_chunks_section
     ON chunks (section_name);
+CREATE INDEX IF NOT EXISTS idx_chunks_quantitative
+    ON chunks (is_quantitative, data_signal_score DESC);
 
 -- Auto-populate tsvector on insert/update
 CREATE OR REPLACE FUNCTION chunks_tsv_trigger() RETURNS TRIGGER AS $$
@@ -335,12 +389,40 @@ CREATE TABLE IF NOT EXISTS news_chunks (
     chunk_index     INTEGER     NOT NULL,
     content         TEXT        NOT NULL,
     token_count     INTEGER     NOT NULL,
+    numeric_token_count INTEGER NOT NULL DEFAULT 0,
+    number_density  REAL        NOT NULL DEFAULT 0,
+    data_signal_score REAL      NOT NULL DEFAULT 0,
+    is_quantitative BOOLEAN     NOT NULL DEFAULT FALSE,
+    content_kind    TEXT        NOT NULL DEFAULT 'narrative',
+    chunk_strategy  TEXT        NOT NULL DEFAULT 'article_sentence_pack',
+    display_title   TEXT,
+    chunk_group_key TEXT,
+    structure_meta  JSONB       NOT NULL DEFAULT '{}'::jsonb,
     embedding       vector(384),
     content_tsv     TSVECTOR,
     source_url      TEXT,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE (news_article_id, chunk_index)
 );
+
+ALTER TABLE news_chunks
+    ADD COLUMN IF NOT EXISTS numeric_token_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE news_chunks
+    ADD COLUMN IF NOT EXISTS number_density REAL NOT NULL DEFAULT 0;
+ALTER TABLE news_chunks
+    ADD COLUMN IF NOT EXISTS data_signal_score REAL NOT NULL DEFAULT 0;
+ALTER TABLE news_chunks
+    ADD COLUMN IF NOT EXISTS is_quantitative BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE news_chunks
+    ADD COLUMN IF NOT EXISTS content_kind TEXT NOT NULL DEFAULT 'narrative';
+ALTER TABLE news_chunks
+    ADD COLUMN IF NOT EXISTS chunk_strategy TEXT NOT NULL DEFAULT 'article_sentence_pack';
+ALTER TABLE news_chunks
+    ADD COLUMN IF NOT EXISTS display_title TEXT;
+ALTER TABLE news_chunks
+    ADD COLUMN IF NOT EXISTS chunk_group_key TEXT;
+ALTER TABLE news_chunks
+    ADD COLUMN IF NOT EXISTS structure_meta JSONB NOT NULL DEFAULT '{}'::jsonb;
 
 CREATE INDEX IF NOT EXISTS idx_news_chunks_embedding_ivfflat
     ON news_chunks USING ivfflat (embedding vector_cosine_ops)
@@ -401,10 +483,53 @@ CREATE TABLE IF NOT EXISTS transcript_chunks (
     chunk_index     INTEGER     NOT NULL,
     content         TEXT        NOT NULL,
     token_count     INTEGER,
+    numeric_token_count INTEGER NOT NULL DEFAULT 0,
+    number_density  REAL        NOT NULL DEFAULT 0,
+    data_signal_score REAL      NOT NULL DEFAULT 0,
+    is_quantitative BOOLEAN     NOT NULL DEFAULT FALSE,
+    content_kind    TEXT        NOT NULL DEFAULT 'narrative',
+    chunk_strategy  TEXT        NOT NULL DEFAULT 'speaker_turn',
+    display_title   TEXT,
+    chunk_group_key TEXT,
+    structure_meta  JSONB       NOT NULL DEFAULT '{}'::jsonb,
     embedding       vector(384),
     content_tsv     TSVECTOR,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+ALTER TABLE transcript_chunks
+    ADD COLUMN IF NOT EXISTS numeric_token_count INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE transcript_chunks
+    ADD COLUMN IF NOT EXISTS number_density REAL NOT NULL DEFAULT 0;
+ALTER TABLE transcript_chunks
+    ADD COLUMN IF NOT EXISTS data_signal_score REAL NOT NULL DEFAULT 0;
+ALTER TABLE transcript_chunks
+    ADD COLUMN IF NOT EXISTS is_quantitative BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE transcript_chunks
+    ADD COLUMN IF NOT EXISTS content_kind TEXT NOT NULL DEFAULT 'narrative';
+ALTER TABLE transcript_chunks
+    ADD COLUMN IF NOT EXISTS chunk_strategy TEXT NOT NULL DEFAULT 'speaker_turn';
+ALTER TABLE transcript_chunks
+    ADD COLUMN IF NOT EXISTS display_title TEXT;
+ALTER TABLE transcript_chunks
+    ADD COLUMN IF NOT EXISTS chunk_group_key TEXT;
+ALTER TABLE transcript_chunks
+    ADD COLUMN IF NOT EXISTS structure_meta JSONB NOT NULL DEFAULT '{}'::jsonb;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'transcript_chunks_transcript_id_chunk_index_key'
+          AND conrelid = 'transcript_chunks'::regclass
+    ) THEN
+        ALTER TABLE transcript_chunks
+            ADD CONSTRAINT transcript_chunks_transcript_id_chunk_index_key
+            UNIQUE (transcript_id, chunk_index);
+    END IF;
+END
+$$;
 
 CREATE INDEX IF NOT EXISTS idx_tc_embedding_ivfflat
     ON transcript_chunks USING ivfflat (embedding vector_cosine_ops)
@@ -435,7 +560,8 @@ CREATE TRIGGER trig_tc_tsv
 -- =============================================================================
 -- Helper view: chunk search results with filing metadata
 -- =============================================================================
-CREATE OR REPLACE VIEW v_chunk_search AS
+DROP VIEW IF EXISTS v_chunk_search;
+CREATE VIEW v_chunk_search AS
 SELECT
     c.id,
     c.ticker,
@@ -445,6 +571,15 @@ SELECT
     c.fiscal_year,
     c.period,
     c.section_name,
+    c.numeric_token_count,
+    c.number_density,
+    c.data_signal_score,
+    c.is_quantitative,
+    c.content_kind,
+    c.chunk_strategy,
+    c.display_title,
+    c.chunk_group_key,
+    c.structure_meta,
     c.content,
     c.token_count,
     c.embedding,
@@ -453,3 +588,90 @@ SELECT
     c.filed_date
 FROM chunks c
 JOIN companies co ON co.ticker = c.ticker;
+
+DROP VIEW IF EXISTS v_retrieval_chunks;
+CREATE VIEW v_retrieval_chunks AS
+SELECT
+    'sec'::text         AS source_type,
+    c.id::text          AS chunk_id,
+    c.ticker,
+    co.name             AS company_name,
+    c.sector,
+    c.filing_type,
+    c.fiscal_year,
+    c.period::text      AS period_label,
+    c.section_name      AS section_name,
+    c.content_kind,
+    c.chunk_strategy,
+    c.display_title,
+    c.chunk_group_key,
+    c.structure_meta,
+    c.numeric_token_count,
+    c.number_density,
+    c.data_signal_score,
+    c.is_quantitative,
+    c.content,
+    c.token_count,
+    c.embedding,
+    c.content_tsv,
+    c.source_url,
+    c.filed_date::date  AS event_date
+FROM chunks c
+JOIN companies co ON co.ticker = c.ticker
+UNION ALL
+SELECT
+    'news'::text        AS source_type,
+    nc.id::text         AS chunk_id,
+    nc.ticker,
+    COALESCE(co.name, nc.ticker) AS company_name,
+    co.sector,
+    NULL::text          AS filing_type,
+    NULL::smallint      AS fiscal_year,
+    NULL::text          AS period_label,
+    'news_article'::text AS section_name,
+    nc.content_kind,
+    nc.chunk_strategy,
+    nc.display_title,
+    nc.chunk_group_key,
+    nc.structure_meta,
+    nc.numeric_token_count,
+    nc.number_density,
+    nc.data_signal_score,
+    nc.is_quantitative,
+    nc.content,
+    nc.token_count,
+    nc.embedding,
+    nc.content_tsv,
+    nc.source_url,
+    nc.published_date::date AS event_date
+FROM news_chunks nc
+LEFT JOIN companies co ON co.ticker = nc.ticker
+UNION ALL
+SELECT
+    'transcript'::text  AS source_type,
+    tc.id::text         AS chunk_id,
+    tc.ticker,
+    COALESCE(co.name, tc.ticker) AS company_name,
+    co.sector,
+    NULL::text          AS filing_type,
+    tc.fiscal_year,
+    ('Q' || tc.quarter)::text AS period_label,
+    tc.section,
+    tc.content_kind,
+    tc.chunk_strategy,
+    tc.display_title,
+    tc.chunk_group_key,
+    tc.structure_meta,
+    tc.numeric_token_count,
+    tc.number_density,
+    tc.data_signal_score,
+    tc.is_quantitative,
+    tc.content,
+    tc.token_count,
+    tc.embedding,
+    tc.content_tsv,
+    et.source_url,
+    et.published_date::date AS event_date
+FROM transcript_chunks tc
+LEFT JOIN earnings_transcripts et ON et.id = tc.transcript_id
+LEFT JOIN companies co ON co.ticker = tc.ticker;

@@ -175,20 +175,69 @@ def build_filter_clause(
     sector: Optional[str],
     company: Optional[str],
     filing_type: Optional[str],
+    fiscal_year: Optional[int],
 ) -> tuple[str, dict]:
     """Return a SQL WHERE fragment using :name placeholders, and a params dict."""
     conditions: list[str] = []
-    params: dict[str, str] = {}
+    params: dict[str, str | int] = {}
     if sector is not None:
         conditions.append("sector = :sector")
         params["sector"] = sector
     if company is not None:
-        conditions.append("ticker = :company")
+        conditions.append("(ticker = :company OR lower(company_name) = lower(:company))")
         params["company"] = company
     if filing_type is not None:
         conditions.append("filing_type = :filing_type")
         params["filing_type"] = filing_type
+    if fiscal_year is not None:
+        conditions.append("fiscal_year = :fiscal_year")
+        params["fiscal_year"] = fiscal_year
     return " AND ".join(conditions), params
+
+
+def query_prefers_quantitative_chunks(query: str) -> bool:
+    lowered = query.lower()
+    keywords = (
+        "revenue",
+        "income",
+        "cash flow",
+        "gross margin",
+        "operating margin",
+        "operating income",
+        "eps",
+        "earnings per share",
+        "guidance",
+        "grew",
+        "growth",
+        "decline",
+        "decrease",
+        "increase",
+        "how much",
+        "what was",
+        "million",
+        "billion",
+        "%",
+    )
+    has_year = any(ch.isdigit() for ch in lowered)
+    return has_year or any(keyword in lowered for keyword in keywords)
+
+
+def query_prefers_explanatory_chunks(query: str) -> bool:
+    lowered = query.lower()
+    keywords = (
+        "why",
+        "risk",
+        "strategy",
+        "demand",
+        "outlook",
+        "guidance",
+        "commentary",
+        "management",
+        "discussion",
+        "explain",
+        "because",
+    )
+    return any(keyword in lowered for keyword in keywords)
 
 
 def _apply_filter(
@@ -224,20 +273,28 @@ async def _vector_search(
     )
     sql = f"""
         SELECT
-            id::text                                                      AS chunk_id,
-            ticker                                                        AS company,
+            chunk_id,
+            ticker                                                AS company,
             sector,
             filing_type,
-            filed_date,
+            event_date                                            AS filed_date,
             source_url,
-            content                                                       AS text,
+            content                                               AS text,
             company_name,
             fiscal_year,
-            (1 - (embedding <=> $1::vector)) * {boost_expr}              AS score_v
-        FROM v_chunk_search
+            period_label,
+            section_name,
+            source_type,
+            content_kind,
+            chunk_strategy,
+            display_title,
+            data_signal_score,
+            is_quantitative,
+            (1 - (embedding <=> $1::vector)) * {boost_expr}       AS score_v
+        FROM v_retrieval_chunks
         WHERE embedding IS NOT NULL
         __FILTER__
-        ORDER BY (1 - (embedding <=> $1::vector)) * {boost_expr} DESC
+        ORDER BY score_v DESC
         LIMIT $2
     """
     sql, filter_vals, _ = _apply_filter(sql, filter_where, filter_params, next_idx=3)
@@ -261,17 +318,25 @@ async def _bm25_search(
     )
     sql = f"""
         SELECT
-            id::text                                                              AS chunk_id,
-            ticker                                                                AS company,
+            chunk_id,
+            ticker                                                AS company,
             sector,
             filing_type,
-            filed_date,
+            event_date                                            AS filed_date,
             source_url,
-            content                                                               AS text,
+            content                                               AS text,
             company_name,
             fiscal_year,
-            ts_rank(content_tsv, plainto_tsquery('english', $1)) * {boost_expr}  AS score_b
-        FROM v_chunk_search
+            period_label,
+            section_name,
+            source_type,
+            content_kind,
+            chunk_strategy,
+            display_title,
+            data_signal_score,
+            is_quantitative,
+            ts_rank(content_tsv, plainto_tsquery('english', $1)) * {boost_expr} AS score_b
+        FROM v_retrieval_chunks
         WHERE content_tsv @@ plainto_tsquery('english', $1)
         __FILTER__
         ORDER BY score_b DESC
@@ -283,6 +348,32 @@ async def _bm25_search(
     return [dict(r) for r in rows]
 
 
+def _compose_article_title(row: dict) -> str:
+    display_title = (row.get("display_title") or "").strip()
+    if display_title:
+        return display_title
+
+    company_name = (row.get("company_name") or row.get("company") or "").strip()
+    source_type = row.get("source_type") or "sec"
+    filing_type = (row.get("filing_type") or "").strip()
+    fiscal_year = row.get("fiscal_year")
+    period_label = (row.get("period_label") or "").strip()
+
+    if source_type == "news":
+        return f"{company_name} News".strip() or "News"
+    if source_type == "transcript":
+        parts = [company_name, "Earnings Call"]
+        if fiscal_year:
+            parts.append(str(fiscal_year))
+        if period_label:
+            parts.append(period_label)
+        return " ".join(part for part in parts if part).strip()
+
+    if fiscal_year:
+        return f"{company_name} {filing_type} {fiscal_year}".strip()
+    return f"{company_name} {filing_type}".strip()
+
+
 async def retrieve(
     pool: asyncpg.Pool,
     query: str,
@@ -291,13 +382,16 @@ async def retrieve(
     sector: Optional[str],
     company: Optional[str],
     filing_type: Optional[str],
+    fiscal_year: Optional[int] = None,
 ) -> list[ChunkResult]:
     overfetch = k * 3
     query_vec = embed_query(query)
     explicit_filing_type = None if filing_type else detect_filing_type_in_query(query)
     hinted_filing_type = None if filing_type else detect_filing_type_hint_in_query(query)
     effective_filing_type = filing_type or explicit_filing_type
-    filter_where, filter_params = build_filter_clause(sector, company, effective_filing_type)
+    filter_where, filter_params = build_filter_clause(
+        sector, company, effective_filing_type, fiscal_year
+    )
 
     # Detect signals before retrieval so boosts are embedded in SQL ORDER BY,
     # affecting which chunks the DB returns rather than just reordering them after.
@@ -306,10 +400,26 @@ async def retrieve(
     boost_years = detect_years_in_query(query)
 
     vec_rows, bm25_rows = await asyncio.gather(
-        _vector_search(pool, query_vec, overfetch, filter_where, filter_params,
-                       boost_ticker, boost_filing_type, boost_years),
-        _bm25_search(pool, query, overfetch, filter_where, filter_params,
-                     boost_ticker, boost_filing_type, boost_years),
+        _vector_search(
+            pool,
+            query_vec,
+            overfetch,
+            filter_where,
+            filter_params,
+            boost_ticker,
+            boost_filing_type,
+            boost_years,
+        ),
+        _bm25_search(
+            pool,
+            query,
+            overfetch,
+            filter_where,
+            filter_params,
+            boost_ticker,
+            boost_filing_type,
+            boost_years,
+        ),
     )
 
     vec_map: dict[str, dict] = {r["chunk_id"]: r for r in vec_rows}
@@ -318,36 +428,66 @@ async def retrieve(
 
     raw_v = [vec_map[cid]["score_v"] if cid in vec_map else 0.0 for cid in all_ids]
     raw_b = [bm25_map[cid]["score_b"] if cid in bm25_map else 0.0 for cid in all_ids]
+    raw_d = [
+        float((vec_map.get(cid) or bm25_map.get(cid) or {}).get("data_signal_score") or 0.0)
+        for cid in all_ids
+    ]
 
     norm_v = minmax_normalize(raw_v) if vec_rows else [0.0] * len(all_ids)
     norm_b = minmax_normalize(raw_b) if bm25_rows else [0.0] * len(all_ids)
+    needs_quant = query_prefers_quantitative_chunks(query)
+    needs_explanatory = query_prefers_explanatory_chunks(query)
+    norm_d = minmax_normalize(raw_d) if needs_quant and raw_d else [0.0] * len(all_ids)
 
     scored = sorted(
-        [(fuse_scores(norm_v[i], norm_b[i], alpha), cid) for i, cid in enumerate(all_ids)],
+        [
+            (
+                fuse_scores(norm_v[i], norm_b[i], alpha)
+                + (0.15 * norm_d[i] if needs_quant else 0.0),
+                cid,
+            )
+            for i, cid in enumerate(all_ids)
+        ],
         reverse=True,
     )
 
     results: list[ChunkResult] = []
     for score, cid in scored[:k]:
         row = vec_map.get(cid) or bm25_map[cid]
-        fiscal_year = row.get("fiscal_year")
-        company_name = row.get("company_name") or ""
+        rerank_bonus = 0.0
+        content_kind = row.get("content_kind")
+        source_type = row.get("source_type") or "sec"
+
+        if needs_quant and content_kind == "table":
+            rerank_bonus += 0.20
+        if needs_explanatory and content_kind == "narrative":
+            rerank_bonus += 0.12
+        if needs_explanatory and source_type == "transcript" and content_kind in {
+            "qa",
+            "narrative",
+        }:
+            rerank_bonus += 0.08
+        if needs_quant and source_type == "news":
+            rerank_bonus -= 0.03
+
         ft = row.get("filing_type") or ""
-        article_title = (
-            f"{company_name} {ft} {fiscal_year}" if fiscal_year else f"{company_name} {ft}"
-        ).strip()
         results.append(
             ChunkResult(
                 chunk_id=cid,
                 text=row["text"],
-                score=round(score, 6),
+                score=round(score + rerank_bonus, 6),
                 company=row["company"],
                 sector=row["sector"],
                 filing_type=ft,
                 filed_date=row.get("filed_date"),
                 source_url=row.get("source_url"),
-                article_title=article_title or None,
+                article_title=_compose_article_title(row) or None,
                 page_num=None,
+                source_type=source_type,
+                content_kind=content_kind,
+                chunk_strategy=row.get("chunk_strategy"),
+                display_title=row.get("display_title"),
             )
         )
+    results.sort(key=lambda chunk: chunk.score, reverse=True)
     return results

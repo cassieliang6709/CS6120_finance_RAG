@@ -50,8 +50,18 @@ def main() -> None:
     parser.add_argument("--tickers", nargs="+", default=None, help="Tickers to process; defaults to all local SEC tickers")
     parser.add_argument("--years", nargs="+", type=int, default=None, help="Years to process; defaults to 2018-2025")
     parser.add_argument("--limit", type=int, default=None, help="Optional limit after filtering and sorting missing filings")
+    parser.add_argument(
+        "--include-existing",
+        action="store_true",
+        help="Reprocess all discovered local filings, not just DB-missing ones",
+    )
     parser.add_argument("--db-url", default=DATABASE_URL, help="PostgreSQL DSN")
     parser.add_argument("--batch-size", type=int, default=EMBEDDING_BATCH_SIZE, help="Embedding batch size")
+    parser.add_argument(
+        "--skip-embed",
+        action="store_true",
+        help="Skip embedding generation and write NULL embeddings for regenerated chunks",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -76,9 +86,9 @@ def main() -> None:
         if (filing_meta[0], filing_meta[1], filing_meta[2], filing_meta[3]) not in existing
     ]
     missing.sort(key=lambda meta: (-meta[2], meta[0], meta[1], meta[3]))
-    remaining = missing
+    remaining = discovered if args.include_existing else missing
     if args.limit is not None:
-        remaining = missing[: args.limit]
+        remaining = remaining[: args.limit]
 
     logger.info("Local SEC tickers: %s", ", ".join(tickers))
     logger.info("Years: %s", years)
@@ -92,13 +102,13 @@ def main() -> None:
         return
 
     with DBLoader(dsn=args.db_url) as loader:
-        embedder = Embedder(batch_size=args.batch_size)
+        embedder = None if args.skip_embed else Embedder(batch_size=args.batch_size)
         loaded_chunks = _process_filings(
             remaining,
             DEFAULT_LOCAL_SEC_FILING_TYPES,
             embedder,
             loader,
-            skip_embed=False,
+            skip_embed=args.skip_embed,
             skip_load=False,
         )
 

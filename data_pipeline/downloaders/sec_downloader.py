@@ -33,8 +33,20 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Type alias for filing metadata tuples returned to the pipeline
 # ---------------------------------------------------------------------------
-FilingMeta = tuple[str, str, int, str, Path, str, Optional[dt.date]]
+FilingMeta = tuple[
+    str,
+    str,
+    int,
+    str,
+    Path,
+    str,
+    Optional[dt.date],
+    Optional[dt.date],
+    str,
+    str,
+]
 #              ticker  type  fiscal_year  period  local_path  source_url  filed_date
+#              period_of_report  accession  cik
 
 
 # ---------------------------------------------------------------------------
@@ -148,12 +160,23 @@ def _parse_yyyymmdd(raw: str | None) -> dt.date | None:
     return dt.datetime.strptime(raw, "%Y%m%d").date()
 
 
-def _infer_fiscal_year(report_date: dt.date | None, fiscal_year_end_mmdd: str | None) -> int:
+def _infer_fiscal_year(
+    filing_type: str,
+    report_date: dt.date | None,
+    fiscal_year_end_mmdd: str | None,
+) -> int:
     """
     Infer the filing's fiscal year from period-of-report and fiscal year end.
     """
     if report_date is None:
         return 0
+
+    # Annual filings should align to the reported fiscal period, not the
+    # subsequent filing year. This avoids mislabeling 52/53-week calendars
+    # like AMD's FY2023 10-K (period-of-report 2023-12-30, filed 2024-01-31)
+    # as FY2024.
+    if filing_type == "10-K":
+        return report_date.year
 
     if not fiscal_year_end_mmdd or len(fiscal_year_end_mmdd) != 4 or not fiscal_year_end_mmdd.isdigit():
         return report_date.year
@@ -186,7 +209,7 @@ def _infer_period(
 
     fy_end_month = int(fiscal_year_end_mmdd[:2])
     fy_end_day = int(fiscal_year_end_mmdd[2:])
-    fiscal_year = _infer_fiscal_year(report_date, fiscal_year_end_mmdd)
+    fiscal_year = _infer_fiscal_year(filing_type, report_date, fiscal_year_end_mmdd)
 
     try:
         prior_fy_end = dt.date(fiscal_year - 1, fy_end_month, fy_end_day)
@@ -337,7 +360,11 @@ class SECDownloader:
                     metadata = _parse_submission_metadata(doc_path.parent)
                     report_date = _parse_yyyymmdd(metadata.get("period_of_report"))
                     filed_date = _parse_yyyymmdd(metadata.get("filed_date"))
-                    fiscal_year = _infer_fiscal_year(report_date, metadata.get("fiscal_year_end"))
+                    fiscal_year = _infer_fiscal_year(
+                        filing_type,
+                        report_date,
+                        metadata.get("fiscal_year_end"),
+                    )
                     if fiscal_year not in year_set:
                         continue
                     period = _infer_period(
@@ -348,7 +375,18 @@ class SECDownloader:
                     cik = metadata.get("cik")
                     source_url = _build_source_url(cik, accession) if cik else ""
                     results.append(
-                        (ticker, filing_type, fiscal_year, period, doc_path, source_url, filed_date)
+                        (
+                            ticker,
+                            filing_type,
+                            fiscal_year,
+                            period,
+                            doc_path,
+                            source_url,
+                            filed_date,
+                            report_date,
+                            accession,
+                            cik or "",
+                        )
                     )
 
         logger.info("Collected %d filing documents from disk", len(results))

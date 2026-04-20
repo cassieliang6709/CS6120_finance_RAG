@@ -76,6 +76,7 @@ from data_pipeline.config import (
     LOG_LEVEL,
     YEARS,
 )
+from data_pipeline.chunk_features import compute_chunk_features
 from data_pipeline.downloaders.market_downloader import MarketDownloader
 from data_pipeline.downloaders.macro_downloader import MacroDownloader
 from data_pipeline.downloaders.news_downloader import NewsDownloader
@@ -86,6 +87,7 @@ from data_pipeline.metadata import resolve_company_metadata
 from data_pipeline.processors.chunker import Chunker
 from data_pipeline.processors.embedder import Embedder
 from data_pipeline.processors.html_cleaner import HTMLCleaner
+from data_pipeline.processors.segment_builders import build_transcript_segments
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +177,9 @@ def _process_filings(
     # Group filings by filing type to reuse cleaner
     for filing_meta in tqdm(filing_metas, desc="Processing filings", unit="filing"):
         try:
+            period_of_report = None
+            accession_number = ""
+            cik = ""
             if len(filing_meta) == 5:
                 ticker, filing_type, fiscal_year, local_path, source_url = filing_meta
                 period = _infer_period(filing_type, fiscal_year)
@@ -182,6 +187,20 @@ def _process_filings(
             elif len(filing_meta) == 6:
                 ticker, filing_type, fiscal_year, local_path, source_url, filed_date = filing_meta
                 period = _infer_period(filing_type, fiscal_year)
+            elif len(filing_meta) >= 10:
+                (
+                    ticker,
+                    filing_type,
+                    fiscal_year,
+                    period,
+                    local_path,
+                    source_url,
+                    filed_date,
+                    period_of_report,
+                    accession_number,
+                    cik,
+                    *_,
+                ) = filing_meta
             else:
                 ticker, filing_type, fiscal_year, period, local_path, source_url, filed_date = filing_meta
 
@@ -189,13 +208,13 @@ def _process_filings(
                 cleaner_cache[filing_type] = HTMLCleaner(filing_type=filing_type)
             cleaner = cleaner_cache[filing_type]
 
-            sections = cleaner.clean(local_path)
-            if not sections:
+            segments = cleaner.clean_segments(local_path)
+            if not segments:
                 logger.warning("No sections extracted from %s", local_path)
                 continue
 
-            raw_chunks = chunker.chunk_sections(sections)
-            if not raw_chunks:
+            chunk_payloads = chunker.chunk_segments(segments)
+            if not chunk_payloads:
                 continue
 
             # Ensure filing row exists in DB
@@ -206,6 +225,9 @@ def _process_filings(
                 "fiscal_year": fiscal_year,
                 "period": period,
                 "filed_date": filed_date,
+                "period_of_report": period_of_report,
+                "accession_number": accession_number,
+                "cik": cik,
                 "source_url": source_url,
                 "local_path": str(local_path),
             }
@@ -230,7 +252,7 @@ def _process_filings(
             filing_id = filing_id_map.get(filing_key)
 
             # Embed
-            texts = [c[1] for c in raw_chunks]
+            texts = [payload.text for payload in chunk_payloads]
             if skip_embed:
                 embeddings = [None] * len(texts)
             else:
@@ -240,7 +262,8 @@ def _process_filings(
             # Build chunk rows
             sector = company_metadata["sector"]
             chunk_rows = []
-            for i, (section_name, chunk_text, token_count) in enumerate(raw_chunks):
+            for i, payload in enumerate(chunk_payloads):
+                chunk_features = compute_chunk_features(payload.section_name, payload.text)
                 chunk_rows.append(
                     {
                         "filing_id": filing_id,
@@ -250,11 +273,20 @@ def _process_filings(
                         "fiscal_year": fiscal_year,
                         "period": period,
                         "filed_date": filed_date,
-                        "section_name": section_name,
+                        "section_name": payload.section_name,
                         "chunk_index": i,
-                        "content": chunk_text,
-                        "char_count": len(chunk_text),
-                        "token_count": token_count,
+                        "content": payload.text,
+                        "char_count": len(payload.text),
+                        "token_count": payload.token_count,
+                        "numeric_token_count": chunk_features["numeric_token_count"],
+                        "number_density": chunk_features["number_density"],
+                        "data_signal_score": chunk_features["data_signal_score"],
+                        "is_quantitative": chunk_features["is_quantitative"],
+                        "content_kind": payload.content_kind,
+                        "chunk_strategy": payload.chunk_strategy,
+                        "display_title": payload.display_title,
+                        "chunk_group_key": payload.chunk_group_key,
+                        "structure_meta": payload.structure_meta,
                         "embedding": embeddings[i],
                         "source_url": source_url,
                     }
@@ -363,25 +395,38 @@ def _process_transcripts(
             all_chunk_rows: list[dict] = []
             chunk_index = 0
 
-            for section_label, section_text in sections.items():
-                if not section_text:
-                    continue
-                raw_chunks = chunker.chunk_section(section_label, section_text)
-                for section_name, chunk_text, token_count in raw_chunks:
-                    all_chunk_rows.append(
-                        {
-                            "transcript_id": transcript_id,
-                            "ticker": ticker,
-                            "fiscal_year": fiscal_year,
-                            "quarter": quarter,
-                            "section": section_label,
-                            "chunk_index": chunk_index,
-                            "content": chunk_text,
-                            "token_count": token_count,
-                            "embedding": None,
-                        }
-                    )
-                    chunk_index += 1
+            transcript_segments = build_transcript_segments(
+                ticker=ticker,
+                fiscal_year=fiscal_year,
+                quarter=quarter,
+                sections=sections,
+            )
+            chunk_payloads = chunker.chunk_segments(transcript_segments)
+            for payload in chunk_payloads:
+                chunk_features = compute_chunk_features(payload.section_name, payload.text)
+                all_chunk_rows.append(
+                    {
+                        "transcript_id": transcript_id,
+                        "ticker": ticker,
+                        "fiscal_year": fiscal_year,
+                        "quarter": quarter,
+                        "section": payload.section_name,
+                        "chunk_index": chunk_index,
+                        "content": payload.text,
+                        "token_count": payload.token_count,
+                        "numeric_token_count": chunk_features["numeric_token_count"],
+                        "number_density": chunk_features["number_density"],
+                        "data_signal_score": chunk_features["data_signal_score"],
+                        "is_quantitative": chunk_features["is_quantitative"],
+                        "content_kind": payload.content_kind,
+                        "chunk_strategy": payload.chunk_strategy,
+                        "display_title": payload.display_title,
+                        "chunk_group_key": payload.chunk_group_key,
+                        "structure_meta": payload.structure_meta,
+                        "embedding": None,
+                    }
+                )
+                chunk_index += 1
 
             if all_chunk_rows and not skip_embed:
                 texts = [r["content"] for r in all_chunk_rows]
@@ -390,6 +435,8 @@ def _process_transcripts(
                     r["embedding"] = emb[i]
 
             if not skip_load and all_chunk_rows:
+                if transcript_id is not None:
+                    loader.prune_transcript_chunks(transcript_id)
                 loader.load_transcript_chunks(all_chunk_rows)
 
             total_chunks += len(all_chunk_rows)

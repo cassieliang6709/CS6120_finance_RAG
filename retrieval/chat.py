@@ -138,25 +138,21 @@ async def get_llm_client() -> AsyncOpenAI:
 
 
 def format_context(chunks: list[ChunkResult]) -> str:
-    """Formats retrieved chunks with a sequential index [n] and metadata."""
-    if not chunks:
-        return "No relevant documents found."
-    
-    context_blocks = []
-    for i, chunk in enumerate(chunks, start=1):
-        title = getattr(chunk, 'article_title', 'Unknown Document')
-        company = getattr(chunk, 'company', 'Unknown')
-        filing_type = getattr(chunk, 'filing_type', 'Unknown')
-        text = getattr(chunk, 'text', '').strip()
-        
-        block = (
-            f"[{i}]\n"
-            f"Title: {title} | Company: {company} | Filing: {filing_type}\n"
-            f"Text: \"{text}\""
-        )
-        context_blocks.append(block)
-        
-    return "\n\n".join(context_blocks)
+    """Format chunks as numbered blocks with source-aware metadata for citation."""
+    blocks = []
+    for i, c in enumerate(chunks, 1):
+        source_label = c.source_type.upper()
+        title = c.display_title or c.article_title or ""
+        header_parts = [f"[{i}]", c.company, source_label]
+        if c.filing_type:
+            header_parts.append(c.filing_type)
+        if title:
+            header_parts.append(f"- {title}")
+        header = " ".join(part for part in header_parts if part)
+        if c.filed_date:
+            header += f" (filed {c.filed_date.isoformat()})"
+        blocks.append(f"{header}\n{c.text}")
+    return "\n\n---\n\n".join(blocks)
 
 
 def build_messages(
@@ -164,7 +160,7 @@ def build_messages(
 ) -> list[dict]:
     """Build the OpenAI chat messages list: one system turn + one user turn."""
     sp = system_prompt or DEFAULT_SYSTEM_PROMPT
-    user = f"Context from SEC filings:\n{context}\nQuestion: {query}"
+    user = f"Context from retrieved company sources:\n\n{context}\n\nQuestion: {query}"
     return [
         {"role": "system", "content": sp},
         {"role": "user", "content": user},

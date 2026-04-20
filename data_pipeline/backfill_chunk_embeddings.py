@@ -14,7 +14,6 @@ from __future__ import annotations
 import argparse
 import logging
 import os
-from typing import Iterable
 
 import numpy as np
 import psycopg2
@@ -28,29 +27,52 @@ from data_pipeline.processors.embedder import Embedder
 logger = logging.getLogger(__name__)
 
 
-def _iter_missing_chunks(
+def _count_missing_chunks(
     conn: psycopg2.extensions.connection,
     limit: int | None = None,
+) -> int:
+    with conn.cursor() as cur:
+        if limit is None:
+            cur.execute("SELECT COUNT(*) FROM chunks WHERE embedding IS NULL")
+        else:
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT 1
+                    FROM chunks
+                    WHERE embedding IS NULL
+                    ORDER BY id
+                    LIMIT %s
+                ) limited
+                """,
+                (limit,),
+            )
+        return int(cur.fetchone()[0])
+
+
+def _fetch_missing_chunk_batch(
+    conn: psycopg2.extensions.connection,
+    batch_size: int,
+    *,
+    after_id: int = 0,
+    remaining_limit: int | None = None,
 ) -> list[tuple[int, str]]:
     sql = """
         SELECT id, content
         FROM chunks
         WHERE embedding IS NULL
+          AND id > %s
         ORDER BY id
+        LIMIT %s
     """
-    params: tuple[int, ...] = ()
-    if limit is not None:
-        sql += " LIMIT %s"
-        params = (limit,)
+    fetch_size = batch_size if remaining_limit is None else min(batch_size, remaining_limit)
+    if fetch_size <= 0:
+        return []
 
     with conn.cursor() as cur:
-        cur.execute(sql, params)
-        return cur.fetchall()
-
-
-def _batched(rows: list[tuple[int, str]], batch_size: int) -> Iterable[list[tuple[int, str]]]:
-    for start in range(0, len(rows), batch_size):
-        yield rows[start : start + batch_size]
+        cur.execute(sql, (after_id, fetch_size))
+        return list(cur.fetchall())
 
 
 def backfill_embeddings(
@@ -67,14 +89,15 @@ def backfill_embeddings(
     register_vector(conn)
 
     try:
-        rows = _iter_missing_chunks(conn, limit=limit)
-        if not rows:
+        total_missing = _count_missing_chunks(conn, limit=limit)
+        if total_missing == 0:
             logger.info("No missing chunk embeddings found")
             return 0
 
-        logger.info("Found %d chunks with NULL embeddings", len(rows))
+        logger.info("Found %d chunks with NULL embeddings", total_missing)
         embedder = Embedder(batch_size=batch_size)
         updated = 0
+        last_id = 0
 
         update_sql = """
             UPDATE chunks
@@ -83,7 +106,17 @@ def backfill_embeddings(
         """
 
         with conn.cursor() as cur:
-            for batch in _batched(rows, batch_size):
+            while True:
+                remaining_limit = None if limit is None else max(limit - updated, 0)
+                batch = _fetch_missing_chunk_batch(
+                    conn,
+                    batch_size,
+                    after_id=last_id,
+                    remaining_limit=remaining_limit,
+                )
+                if not batch:
+                    break
+
                 ids = [row_id for row_id, _ in batch]
                 texts = [content for _, content in batch]
                 embeddings = embedder.encode(texts)
@@ -99,7 +132,8 @@ def backfill_embeddings(
                 psycopg2.extras.execute_batch(cur, update_sql, payload, page_size=batch_size)
                 conn.commit()
                 updated += len(payload)
-                logger.info("Updated %d / %d chunk embeddings", updated, len(rows))
+                last_id = ids[-1]
+                logger.info("Updated %d / %d chunk embeddings", updated, total_missing)
 
         return updated
     except Exception:

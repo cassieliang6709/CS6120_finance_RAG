@@ -34,8 +34,8 @@ def test_format_context_numbers_blocks_sequentially():
         _chunk("b", "JPM net interest income rose.", company="JPM"),
     ]
     out = format_context(chunks)
-    assert "[1] AAPL 10-K" in out
-    assert "[2] JPM 10-K" in out
+    assert "[1] AAPL SEC 10-K" in out
+    assert "[2] JPM SEC 10-K" in out
     assert "Apple revenue grew 8%." in out
     assert "JPM net interest income rose." in out
     # Blocks should be separated by the delimiter
@@ -59,13 +59,13 @@ def test_format_context_empty_list():
 
 
 def test_build_messages_uses_default_system_prompt():
-    msgs = build_messages("What is ROE?", "[1] AAPL 10-K\nsome text", None)
+    msgs = build_messages("What is ROE?", "[1] AAPL SEC 10-K\nsome text", None)
     assert len(msgs) == 2
     assert msgs[0]["role"] == "system"
     assert msgs[0]["content"] == DEFAULT_SYSTEM_PROMPT
     assert msgs[1]["role"] == "user"
     assert "What is ROE?" in msgs[1]["content"]
-    assert "[1] AAPL 10-K" in msgs[1]["content"]
+    assert "[1] AAPL SEC 10-K" in msgs[1]["content"]
 
 
 def test_build_messages_custom_system_prompt_override():

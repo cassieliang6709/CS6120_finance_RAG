@@ -193,18 +193,33 @@ class DBLoader:
         (ticker, filing_type, fiscal_year, period) -> filing_id.
 
         Expected keys: ticker, filing_type, fiscal_year, period,
-                       filed_date, source_url, local_path.
+                       filed_date, period_of_report, accession_number,
+                       cik, source_url, local_path.
         """
         sql = """
-            INSERT INTO filings (ticker, filing_type, fiscal_year, period, filed_date, source_url, local_path)
+            INSERT INTO filings (
+                ticker, filing_type, fiscal_year, period, filed_date,
+                period_of_report, accession_number, cik, source_url, local_path
+            )
             VALUES (%(ticker)s, %(filing_type)s, %(fiscal_year)s, %(period)s,
-                    %(filed_date)s, %(source_url)s, %(local_path)s)
+                    %(filed_date)s, %(period_of_report)s, %(accession_number)s,
+                    %(cik)s, %(source_url)s, %(local_path)s)
             ON CONFLICT (ticker, filing_type, fiscal_year, period) DO UPDATE SET
                 filed_date  = EXCLUDED.filed_date,
+                period_of_report = COALESCE(EXCLUDED.period_of_report, filings.period_of_report),
+                accession_number = COALESCE(NULLIF(EXCLUDED.accession_number, ''), filings.accession_number),
+                cik         = COALESCE(NULLIF(EXCLUDED.cik, ''), filings.cik),
                 source_url  = EXCLUDED.source_url,
                 local_path  = EXCLUDED.local_path
         """
-        self._execute_batch(sql, rows)
+        normalised_rows = []
+        for row in rows:
+            r = dict(row)
+            r.setdefault("period_of_report", None)
+            r.setdefault("accession_number", "")
+            r.setdefault("cik", "")
+            normalised_rows.append(r)
+        self._execute_batch(sql, normalised_rows)
 
         # Fetch back the IDs
         id_map: dict[tuple, int] = {}
@@ -212,7 +227,7 @@ class DBLoader:
             return id_map
 
         with self.conn.cursor() as cur:
-            for row in rows:
+            for row in normalised_rows:
                 cur.execute(
                     """
                     SELECT id FROM filings
@@ -239,8 +254,11 @@ class DBLoader:
 
         Expected keys: filing_id, ticker, sector, filing_type, fiscal_year,
                        period, filed_date, section_name, chunk_index, content,
-                       char_count, token_count, embedding (numpy array or list),
-                       source_url.
+                       char_count, token_count, numeric_token_count,
+                       number_density, data_signal_score, is_quantitative,
+                       content_kind, chunk_strategy, display_title,
+                       chunk_group_key, structure_meta, embedding
+                       (numpy array or list), source_url.
 
         The ``content_tsv`` column is populated automatically by a DB trigger.
         """
@@ -248,14 +266,20 @@ class DBLoader:
             INSERT INTO chunks (
                 filing_id, ticker, sector, filing_type, fiscal_year, period,
                 filed_date, section_name, chunk_index, content, char_count,
-                token_count, embedding, source_url
+                token_count, numeric_token_count, number_density,
+                data_signal_score, is_quantitative, content_kind,
+                chunk_strategy, display_title, chunk_group_key,
+                structure_meta, embedding, source_url
             )
             VALUES (
                 %(filing_id)s, %(ticker)s, %(sector)s, %(filing_type)s,
                 %(fiscal_year)s, %(period)s,
                 COALESCE(%(filed_date)s, (SELECT filed_date FROM filings WHERE id = %(filing_id)s)),
                 %(section_name)s, %(chunk_index)s, %(content)s, %(char_count)s,
-                %(token_count)s, %(embedding)s, %(source_url)s
+                %(token_count)s, %(numeric_token_count)s, %(number_density)s,
+                %(data_signal_score)s, %(is_quantitative)s, %(content_kind)s,
+                %(chunk_strategy)s, %(display_title)s, %(chunk_group_key)s,
+                %(structure_meta)s, %(embedding)s, %(source_url)s
             )
             ON CONFLICT (filing_id, chunk_index) DO UPDATE SET
                 ticker      = EXCLUDED.ticker,
@@ -268,6 +292,15 @@ class DBLoader:
                 content     = EXCLUDED.content,
                 char_count  = EXCLUDED.char_count,
                 token_count = EXCLUDED.token_count,
+                numeric_token_count = EXCLUDED.numeric_token_count,
+                number_density = EXCLUDED.number_density,
+                data_signal_score = EXCLUDED.data_signal_score,
+                is_quantitative = EXCLUDED.is_quantitative,
+                content_kind = EXCLUDED.content_kind,
+                chunk_strategy = EXCLUDED.chunk_strategy,
+                display_title = EXCLUDED.display_title,
+                chunk_group_key = EXCLUDED.chunk_group_key,
+                structure_meta = EXCLUDED.structure_meta,
                 embedding   = EXCLUDED.embedding,
                 source_url  = EXCLUDED.source_url
         """
@@ -277,6 +310,17 @@ class DBLoader:
             r = dict(row)
             r.setdefault("filed_date", None)
             r.setdefault("chunk_index", None)
+            r.setdefault("numeric_token_count", 0)
+            r.setdefault("number_density", 0.0)
+            r.setdefault("data_signal_score", 0.0)
+            r.setdefault("is_quantitative", False)
+            r.setdefault("content_kind", "narrative")
+            r.setdefault("chunk_strategy", "sentence_pack")
+            r.setdefault("display_title", None)
+            r.setdefault("chunk_group_key", None)
+            r.setdefault("structure_meta", psycopg2.extras.Json({}))
+            if not isinstance(r["structure_meta"], psycopg2.extras.Json):
+                r["structure_meta"] = psycopg2.extras.Json(r["structure_meta"] or {})
             if r.get("embedding") is not None:
                 if not isinstance(r["embedding"], np.ndarray):
                     r["embedding"] = np.array(r["embedding"], dtype=np.float32)
@@ -479,17 +523,27 @@ class DBLoader:
         Upsert news chunks into ``news_chunks``.
 
         Expected keys: news_article_id, ticker, published_date, source,
-                       chunk_index, content, token_count, source_url,
+                       chunk_index, content, token_count, numeric_token_count,
+                       number_density, data_signal_score, is_quantitative,
+                       content_kind, chunk_strategy, display_title,
+                       chunk_group_key, structure_meta, source_url,
                        embedding (numpy array or None).
         """
         sql = """
             INSERT INTO news_chunks (
                 news_article_id, ticker, published_date, source,
-                chunk_index, content, token_count, source_url, embedding
+                chunk_index, content, token_count, numeric_token_count,
+                number_density, data_signal_score, is_quantitative,
+                content_kind, chunk_strategy, display_title, chunk_group_key,
+                structure_meta, source_url, embedding
             )
             VALUES (
                 %(news_article_id)s, %(ticker)s, %(published_date)s, %(source)s,
-                %(chunk_index)s, %(content)s, %(token_count)s, %(source_url)s,
+                %(chunk_index)s, %(content)s, %(token_count)s,
+                %(numeric_token_count)s, %(number_density)s,
+                %(data_signal_score)s, %(is_quantitative)s,
+                %(content_kind)s, %(chunk_strategy)s, %(display_title)s,
+                %(chunk_group_key)s, %(structure_meta)s, %(source_url)s,
                 %(embedding)s
             )
             ON CONFLICT (news_article_id, chunk_index) DO UPDATE SET
@@ -498,12 +552,32 @@ class DBLoader:
                 source         = EXCLUDED.source,
                 content        = EXCLUDED.content,
                 token_count    = EXCLUDED.token_count,
+                numeric_token_count = EXCLUDED.numeric_token_count,
+                number_density = EXCLUDED.number_density,
+                data_signal_score = EXCLUDED.data_signal_score,
+                is_quantitative = EXCLUDED.is_quantitative,
+                content_kind   = EXCLUDED.content_kind,
+                chunk_strategy = EXCLUDED.chunk_strategy,
+                display_title  = EXCLUDED.display_title,
+                chunk_group_key = EXCLUDED.chunk_group_key,
+                structure_meta = EXCLUDED.structure_meta,
                 source_url     = EXCLUDED.source_url,
                 embedding      = EXCLUDED.embedding
         """
         normalised_rows = []
         for row in rows:
             r = dict(row)
+            r.setdefault("numeric_token_count", 0)
+            r.setdefault("number_density", 0.0)
+            r.setdefault("data_signal_score", 0.0)
+            r.setdefault("is_quantitative", False)
+            r.setdefault("content_kind", "narrative")
+            r.setdefault("chunk_strategy", "article_sentence_pack")
+            r.setdefault("display_title", None)
+            r.setdefault("chunk_group_key", None)
+            r.setdefault("structure_meta", psycopg2.extras.Json({}))
+            if not isinstance(r["structure_meta"], psycopg2.extras.Json):
+                r["structure_meta"] = psycopg2.extras.Json(r["structure_meta"] or {})
             if r.get("embedding") is not None:
                 if not isinstance(r["embedding"], np.ndarray):
                     r["embedding"] = np.array(r["embedding"], dtype=np.float32)
@@ -514,6 +588,19 @@ class DBLoader:
         n = self._execute_batch(sql, normalised_rows)
         logger.info("Loaded %d news_chunks rows", n)
         return n
+
+    def prune_news_chunks_for_article(self, news_article_id: int) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM news_chunks
+                WHERE news_article_id = %s
+                """,
+                (news_article_id,),
+            )
+            deleted = cur.rowcount
+        self.conn.commit()
+        return deleted
 
     # ------------------------------------------------------------------
     # 9. earnings_transcripts
@@ -573,23 +660,59 @@ class DBLoader:
 
         Expected keys: transcript_id, ticker, fiscal_year, quarter,
                        section, chunk_index, content, token_count,
-                       embedding (numpy array or None).
+                       numeric_token_count, number_density,
+                       data_signal_score, is_quantitative, content_kind,
+                       chunk_strategy, display_title, chunk_group_key,
+                       structure_meta, embedding (numpy array or None).
         """
         sql = """
             INSERT INTO transcript_chunks (
                 transcript_id, ticker, fiscal_year, quarter,
-                section, chunk_index, content, token_count, embedding
+                section, chunk_index, content, token_count,
+                numeric_token_count, number_density, data_signal_score,
+                is_quantitative, content_kind, chunk_strategy,
+                display_title, chunk_group_key, structure_meta, embedding
             )
             VALUES (
                 %(transcript_id)s, %(ticker)s, %(fiscal_year)s, %(quarter)s,
                 %(section)s, %(chunk_index)s, %(content)s, %(token_count)s,
-                %(embedding)s
+                %(numeric_token_count)s, %(number_density)s,
+                %(data_signal_score)s, %(is_quantitative)s, %(content_kind)s,
+                %(chunk_strategy)s, %(display_title)s, %(chunk_group_key)s,
+                %(structure_meta)s, %(embedding)s
             )
-            ON CONFLICT DO NOTHING
+            ON CONFLICT (transcript_id, chunk_index) DO UPDATE SET
+                ticker = EXCLUDED.ticker,
+                fiscal_year = EXCLUDED.fiscal_year,
+                quarter = EXCLUDED.quarter,
+                section = EXCLUDED.section,
+                content = EXCLUDED.content,
+                token_count = EXCLUDED.token_count,
+                numeric_token_count = EXCLUDED.numeric_token_count,
+                number_density = EXCLUDED.number_density,
+                data_signal_score = EXCLUDED.data_signal_score,
+                is_quantitative = EXCLUDED.is_quantitative,
+                content_kind = EXCLUDED.content_kind,
+                chunk_strategy = EXCLUDED.chunk_strategy,
+                display_title = EXCLUDED.display_title,
+                chunk_group_key = EXCLUDED.chunk_group_key,
+                structure_meta = EXCLUDED.structure_meta,
+                embedding = EXCLUDED.embedding
         """
         normalised_rows = []
         for row in rows:
             r = dict(row)
+            r.setdefault("numeric_token_count", 0)
+            r.setdefault("number_density", 0.0)
+            r.setdefault("data_signal_score", 0.0)
+            r.setdefault("is_quantitative", False)
+            r.setdefault("content_kind", "narrative")
+            r.setdefault("chunk_strategy", "speaker_turn")
+            r.setdefault("display_title", None)
+            r.setdefault("chunk_group_key", None)
+            r.setdefault("structure_meta", psycopg2.extras.Json({}))
+            if not isinstance(r["structure_meta"], psycopg2.extras.Json):
+                r["structure_meta"] = psycopg2.extras.Json(r["structure_meta"] or {})
             if r.get("embedding") is not None:
                 if not isinstance(r["embedding"], np.ndarray):
                     r["embedding"] = np.array(r["embedding"], dtype=np.float32)
@@ -600,6 +723,19 @@ class DBLoader:
         n = self._execute_batch(sql, normalised_rows)
         logger.info("Loaded %d transcript_chunks", n)
         return n
+
+    def prune_transcript_chunks(self, transcript_id: int) -> int:
+        with self.conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM transcript_chunks
+                WHERE transcript_id = %s
+                """,
+                (transcript_id,),
+            )
+            deleted = cur.rowcount
+        self.conn.commit()
+        return deleted
 
     # ------------------------------------------------------------------
     # Stats

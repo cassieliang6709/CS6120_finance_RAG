@@ -102,6 +102,7 @@ async def retrieve_endpoint(req: RetrieveRequest):
         sector=req.sector,
         company=req.company,
         filing_type=req.filing_type,
+        fiscal_year=req.year,
     )
     return RetrieveResponse(chunks=chunks)
 
@@ -123,6 +124,7 @@ async def chat_endpoint(req: ChatRequest, request: Request):
         sector=req.sector,
         company=req.company,
         filing_type=req.filing_type,
+        fiscal_year=req.year,
     )
 
     if req.stream:
