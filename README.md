@@ -1,6 +1,34 @@
-# CS 6120 Financial RAG Pipeline
+# CorpCheck
 
-SEC filing retrieval-augmented generation system for a 50-ticker project universe. The current live snapshot includes local SEC 10-K/10-Q coverage for all 50 project tickers across 2018-2025, chunks and embeds the text, and loads everything into PostgreSQL with pgvector for hybrid (vector + full-text) retrieval.
+Grounded financial question answering over SEC filings.
+
+CorpCheck is a financial RAG system built for long-form SEC documents. It
+downloads and cleans 10-K / 10-Q filings from EDGAR, detects important filing
+sections, chunks and embeds the text, stores retrieval-ready data in
+PostgreSQL + pgvector, and serves citation-grounded answers through retrieval
+and chat APIs.
+
+The current snapshot covers 50 public companies across 2018-2025 and includes:
+
+- `1,511` SEC filings
+- `162,234` retrievable text chunks
+- `228,573` total rows across project tables
+- Hybrid retrieval with vector search + BM25
+- Citation-grounded streaming answers backed by retrieved source passages
+
+This repo contains both the data pipeline and the retrieval/chat service used
+to power CorpCheck.
+
+## What the system does
+
+1. Download 10-K / 10-Q filings from EDGAR.
+2. Remove boilerplate content such as cover pages, signature blocks, and
+   exhibit indexes.
+3. Detect key sections such as Risk Factors, MD&A, and Financial Statements.
+4. Split cleaned filings into overlapping chunks and generate embeddings.
+5. Store chunks, metadata, and vectors in PostgreSQL + pgvector.
+6. Retrieve the most relevant chunks with hybrid search and generate answers
+   grounded in the source documents.
 
 ## Quick start (Docker)
 
@@ -20,6 +48,18 @@ If already build once:
 ```bash
 docker compose up
 ```
+
+## Optional local demo UI
+
+This repo also includes a Streamlit frontend for local demos:
+
+```bash
+streamlit run streamlit_app.py
+```
+
+The Streamlit app talks to the retrieval service and renders retrieved sources,
+streamed model output, and inline citations. Configure `RAG_URL` and the
+optional `API_KEY` in your environment or `.env` before starting it.
 
 ## Environment variables
 
